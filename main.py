@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import json
 import mimetypes
 import os
@@ -154,10 +155,13 @@ class GitHubRepoDialog(QDialog):
         self.load_btn.clicked.connect(self.load_tree)
         self.add_btn = QPushButton("加入 AI 上下文")
         self.add_btn.clicked.connect(self.add_selected_to_context)
+        self.edit_btn = QPushButton("编辑 / Diff / Push")
+        self.edit_btn.clicked.connect(self.edit_selected_file)
         actions.addWidget(self.test_btn)
         actions.addWidget(self.load_btn)
         actions.addStretch()
         actions.addWidget(self.add_btn)
+        actions.addWidget(self.edit_btn)
         layout.addLayout(actions)
 
         self.status = QLabel("未连接")
@@ -207,7 +211,7 @@ class GitHubRepoDialog(QDialog):
         self.repo_owner, self.repo_name = m.group(1), m.group(2)
         return self.repo_owner, self.repo_name
 
-    def github_request(self, path):
+    def github_request(self, path, method="GET", payload=None):
         owner, name = self.parse_repo()
         url = f"https://api.github.com/repos/{owner}/{name}{path}"
         headers = {
@@ -218,19 +222,30 @@ class GitHubRepoDialog(QDialog):
         token = self.token.text().strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        req = urllib.request.Request(url, headers=headers)
+
+        body = None
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
+            body_text = e.read().decode("utf-8", errors="replace")
             if e.code == 401:
                 raise RuntimeError("GitHub Token 无效或已过期。")
             if e.code == 403:
-                raise RuntimeError("GitHub 拒绝访问。请检查 Token 权限或 API 限额。")
+                raise RuntimeError("GitHub 拒绝访问。请检查 Token 的 Contents 写入权限或 API 限额。")
             if e.code == 404:
-                raise RuntimeError("找不到仓库或当前 Token 无权访问该私有仓库。")
-            raise RuntimeError(f"GitHub API HTTP {e.code}: {body[:500]}")
+                raise RuntimeError("找不到仓库/文件，或当前 Token 无权访问该私有仓库。")
+            if e.code == 409:
+                raise RuntimeError("GitHub 提交冲突。请重新加载文件后再修改提交。")
+            if e.code == 422:
+                raise RuntimeError(f"GitHub 拒绝提交：{body_text[:600]}")
+            raise RuntimeError(f"GitHub API HTTP {e.code}: {body_text[:600]}")
 
     def test_connection(self):
         try:
@@ -272,6 +287,44 @@ class GitHubRepoDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "加载失败", str(e))
 
+    def edit_selected_file(self):
+        items = [i for i in self.tree.selectedItems() if not i.isDisabled()]
+        if len(items) != 1:
+            QMessageBox.information(self, "请选择一个文件", "编辑与提交时请只选择一个仓库文件。")
+            return
+        if not self.token.text().strip():
+            QMessageBox.warning(
+                self,
+                "需要 GitHub Token",
+                "修改并 Push 仓库需要具有 Contents 写权限的 GitHub PAT。"
+            )
+            return
+
+        try:
+            entry = items[0].data(0, Qt.UserRole) or {}
+            path = entry.get("path")
+            if not path:
+                return
+            branch = self.branch.text().strip() or "main"
+            quoted = urllib.parse.quote(path, safe="/")
+            data = self.github_request(
+                f"/contents/{quoted}?ref={urllib.parse.quote(branch, safe='')}"
+            )
+            if data.get("encoding") != "base64" or not data.get("content"):
+                raise RuntimeError("该文件无法通过 GitHub Contents API 读取。")
+            raw = base64.b64decode(data["content"])
+            if b"\x00" in raw[:8192]:
+                raise RuntimeError("当前文件看起来是二进制文件，暂不支持直接代码编辑。")
+            text = raw.decode("utf-8", errors="replace")
+            sha = data.get("sha")
+            if not sha:
+                raise RuntimeError("未获取到文件 SHA，无法安全提交。")
+
+            editor = GitHubFileEditorDialog(self, path, text, sha)
+            editor.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "打开编辑器失败", str(e))
+
     def add_selected_to_context(self):
         items = [i for i in self.tree.selectedItems() if not i.isDisabled()]
         if not items:
@@ -300,6 +353,138 @@ class GitHubRepoDialog(QDialog):
             QMessageBox.information(self, "已加入上下文", f"已加入 {len(added)} 个仓库文件。")
         except Exception as e:
             QMessageBox.warning(self, "读取失败", str(e))
+
+
+
+class GitHubFileEditorDialog(QDialog):
+    def __init__(self, repo_dialog, path, original_text, sha):
+        super().__init__(repo_dialog)
+        self.repo_dialog = repo_dialog
+        self.path = path
+        self.original_text = original_text
+        self.sha = sha
+        self.setWindowTitle(f"编辑仓库文件 · {path}")
+        self.resize(980, 760)
+        self.build_ui()
+        self.refresh_diff()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        path_label = QLabel(self.path)
+        path_label.setStyleSheet("font-weight:700;")
+        top.addWidget(path_label)
+        top.addStretch()
+        self.diff_btn = QPushButton("刷新 Diff")
+        self.diff_btn.clicked.connect(self.refresh_diff)
+        top.addWidget(self.diff_btn)
+        layout.addLayout(top)
+
+        tabs = QTabWidget()
+
+        edit_page = QWidget()
+        edit_layout = QVBoxLayout(edit_page)
+        edit_hint = QLabel("修改代码后先查看 Diff，再确认提交。")
+        edit_hint.setObjectName("helperText")
+        edit_layout.addWidget(edit_hint)
+        self.editor = QTextEdit()
+        self.editor.setFont(QFont("Consolas", 10))
+        self.editor.setPlainText(self.original_text)
+        edit_layout.addWidget(self.editor)
+        tabs.addTab(edit_page, "编辑")
+
+        diff_page = QWidget()
+        diff_layout = QVBoxLayout(diff_page)
+        self.diff_view = QTextEdit()
+        self.diff_view.setReadOnly(True)
+        self.diff_view.setFont(QFont("Consolas", 10))
+        diff_layout.addWidget(self.diff_view)
+        tabs.addTab(diff_page, "Diff")
+
+        layout.addWidget(tabs, 1)
+
+        commit_form = QFormLayout()
+        self.commit_message = QLineEdit()
+        self.commit_message.setPlaceholderText(f"update {self.path}")
+        commit_form.addRow("Commit Message", self.commit_message)
+        layout.addLayout(commit_form)
+
+        warning = QLabel("提交会直接更新当前绑定仓库/分支。提交前会再次要求确认。")
+        warning.setWordWrap(True)
+        warning.setObjectName("helperText")
+        layout.addWidget(warning)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        commit_btn = QPushButton("确认并 Push")
+        commit_btn.setStyleSheet(
+            "QPushButton { background:#2563eb; color:white; border:none; font-weight:600; padding:7px 18px; }"
+            "QPushButton:hover { background:#1d4ed8; }"
+        )
+        commit_btn.clicked.connect(self.commit_changes)
+        row.addWidget(cancel_btn)
+        row.addWidget(commit_btn)
+        layout.addLayout(row)
+
+    def refresh_diff(self):
+        current = self.editor.toPlainText()
+        diff = difflib.unified_diff(
+            self.original_text.splitlines(),
+            current.splitlines(),
+            fromfile=f"a/{self.path}",
+            tofile=f"b/{self.path}",
+            lineterm=""
+        )
+        text = "\n".join(diff)
+        self.diff_view.setPlainText(text or "没有改动。")
+
+    def commit_changes(self):
+        current = self.editor.toPlainText()
+        if current == self.original_text:
+            QMessageBox.information(self, "没有改动", "当前文件内容没有变化，无需提交。")
+            return
+
+        message = self.commit_message.text().strip() or f"update {self.path}"
+        branch = self.repo_dialog.branch.text().strip() or "main"
+
+        self.refresh_diff()
+        answer = QMessageBox.question(
+            self,
+            "确认提交",
+            f"确定将修改提交到：\n{self.repo_dialog.repo_url.text().strip()}\n"
+            f"分支：{branch}\n文件：{self.path}\n\nCommit：{message}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            payload = {
+                "message": message,
+                "content": base64.b64encode(current.encode("utf-8")).decode("ascii"),
+                "sha": self.sha,
+                "branch": branch,
+            }
+            quoted = urllib.parse.quote(self.path, safe="/")
+            data = self.repo_dialog.github_request(
+                f"/contents/{quoted}",
+                method="PUT",
+                payload=payload,
+            )
+            commit_sha = ((data.get("commit") or {}).get("sha") or "")[:12]
+            self.repo_dialog.status.setText(f"Push 成功：{self.path} · {commit_sha}")
+            QMessageBox.information(
+                self,
+                "提交成功",
+                f"文件已提交并推送到 GitHub。\nCommit: {commit_sha or '已创建'}",
+            )
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "提交失败", str(e))
 
 
 class GeminiWorker(QThread):
