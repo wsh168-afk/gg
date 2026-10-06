@@ -1,1 +1,13 @@
-__pycache__/\n*.py[cod]\n.venv/\nvenv/\ndist/\nbuild/\n*.spec\n.env\n.env.*\n!/.env.example\n*.log\n.DS_Store\nThumbs.db\n
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.spec
+.env
+.env.*
+!/.env.example
+*.log
+.DS_Store
+Thumbs.db
