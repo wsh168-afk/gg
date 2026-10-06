@@ -1,0 +1,1 @@
+__pycache__/\n*.py[cod]\n.venv/\nvenv/\ndist/\nbuild/\n*.spec\n.env\n.env.*\n!/.env.example\n*.log\n.DS_Store\nThumbs.db\n
