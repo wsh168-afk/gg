@@ -508,6 +508,10 @@ class GeminiWorker(QThread):
         self.top_p = top_p
         self.top_k = top_k
         self.max_tokens = max_tokens
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
 
     def expand_input_files(self):
         expanded = []
@@ -620,6 +624,9 @@ class GeminiWorker(QThread):
                 contents=contents,
                 config=config,
             ):
+                if self._cancel_requested:
+                    self.completed.emit("".join(result))
+                    return
                 text = getattr(event, "text", None)
                 if text:
                     result.append(text)
@@ -724,6 +731,10 @@ class GeminiWorker(QThread):
             if not url.endswith("/v1/chat/completions"):
                 url += "/v1/chat/completions"
 
+            if self._cancel_requested:
+                self.completed.emit("")
+                return
+
             req = urllib.request.Request(
                 url,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -737,6 +748,11 @@ class GeminiWorker(QThread):
 
             with urllib.request.urlopen(req, timeout=300) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
+
+            if self._cancel_requested:
+                self.completed.emit("")
+                return
+
             data = json.loads(raw)
             text = data["choices"][0]["message"]["content"]
             if isinstance(text, list):
@@ -986,6 +1002,11 @@ class MainWindow(QMainWindow):
         send_row = QHBoxLayout()
         clear_btn = QPushButton("清空上下文")
         clear_btn.clicked.connect(self.clear_history)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.clicked.connect(self.stop_generation)
+        self.stop_btn.setMinimumHeight(40)
+        self.stop_btn.setEnabled(False)
+
         self.send_btn = QPushButton("发送")
         self.send_btn.clicked.connect(self.send_prompt)
         self.send_btn.setMinimumHeight(40)
@@ -996,6 +1017,7 @@ class MainWindow(QMainWindow):
         )
         send_row.addWidget(clear_btn)
         send_row.addStretch()
+        send_row.addWidget(self.stop_btn)
         send_row.addWidget(self.send_btn)
         rl.addLayout(send_row)
 
@@ -1187,6 +1209,12 @@ class MainWindow(QMainWindow):
             f"QPushButton {{ background:{t['accent']}; color:white; border:none; "
             "font-weight:600; padding:7px 20px; border-radius:7px; }}"
             f"QPushButton:hover {{ background:{t['accent_hover']}; }}"
+            "QPushButton:disabled { background:#7a7f87; color:#d7d7d7; }"
+        )
+        self.stop_btn.setStyleSheet(
+            "QPushButton { background:#dc2626; color:white; border:none; "
+            "font-weight:600; padding:7px 18px; border-radius:7px; }"
+            "QPushButton:hover { background:#b91c1c; }"
             "QPushButton:disabled { background:#7a7f87; color:#d7d7d7; }"
         )
 
@@ -1381,6 +1409,7 @@ class MainWindow(QMainWindow):
         self.refresh_chat(streaming="正在生成…")
         self.send_btn.setEnabled(False)
         self.send_btn.setText("生成中…")
+        self.stop_btn.setEnabled(True)
 
         self.worker = GeminiWorker(
             key,
@@ -1400,20 +1429,43 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.on_error)
         self.worker.start()
 
-    def on_chunk(self, text):
+    def stop_generation(self):
+        if not self.worker or not self.worker.isRunning():
+            self.stop_btn.setEnabled(False)
+            return
+
+        self.worker.cancel()
+        self.stop_btn.setEnabled(False)
+        self.statusBar().showMessage("正在停止生成…")
+
+        if self.history and self.history[-1].role == "user":
+            pass
+
+        def on_chunk(self, text):
         self.current_response += text
         self.raw.moveCursor(QTextCursor.End)
         self.raw.insertPlainText(text)
         self.refresh_chat(streaming=self.current_response)
 
     def on_done(self, text):
-        self.history.append(ChatMessage("assistant", text or self.current_response))
+        stopped = bool(self.worker and getattr(self.worker, "_cancel_requested", False))
+        final_text = text or self.current_response
+
+        if final_text:
+            self.history.append(ChatMessage("assistant", final_text))
+
         self.current_response = ""
-        self.files.clear()
-        self.file_list.clear()
         self.send_btn.setEnabled(True)
         self.send_btn.setText("发送")
-        self.statusBar().showMessage("生成完成", 4000)
+        self.stop_btn.setEnabled(False)
+
+        if stopped:
+            self.statusBar().showMessage("已停止生成，指令与附件已保留", 5000)
+        else:
+            self.files.clear()
+            self.file_list.clear()
+            self.statusBar().showMessage("生成完成", 4000)
+
         self.refresh_chat()
         self.refresh_visual_preview()
 
@@ -1451,6 +1503,7 @@ class MainWindow(QMainWindow):
     def on_error(self, text):
         self.send_btn.setEnabled(True)
         self.send_btn.setText("发送")
+        self.stop_btn.setEnabled(False)
 
         error_record = f"【请求失败】\n{text}"
         self.history.append(ChatMessage("assistant", error_record))
