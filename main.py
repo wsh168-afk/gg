@@ -1566,7 +1566,7 @@ class MainWindow(QMainWindow):
             parts.append(
                 "<div class='code-card'>"
                 f"<div class='code-head'><span>{lang}</span>"
-                f"<button onclick=\\"copyB64('{encoded}', this)\\">复制代码</button></div>"
+                f'<button onclick="copyB64(\'{encoded}\', this)">复制代码</button></div>'
                 f"<pre><code>{safe_code}</code></pre></div>"
             )
             pos = match.end()
@@ -1610,7 +1610,7 @@ class MainWindow(QMainWindow):
             actions = ""
             if not is_user:
                 actions = (
-                    f"<button class='copy-answer' onclick=\\"copyB64('{raw_b64}', this)\\">复制回答</button>"
+                    f'<button class="copy-answer" onclick="copyB64(\'{raw_b64}\', this)">复制回答</button>'
                 )
 
             if (not is_user) and len(m.text or "") > 1800:
