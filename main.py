@@ -4,8 +4,11 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import sys
+import tempfile
 import urllib.error
+import uuid
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -18,6 +21,7 @@ from PySide6.QtWidgets import (
     QSlider, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QTextEdit,
     QToolBar, QVBoxLayout, QWidget,
 )
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from google import genai
 from google.genai import types
 
@@ -32,12 +36,62 @@ class ChatMessage:
 
 class SendTextEdit(QTextEdit):
     send_requested = Signal()
+    files_attached = Signal(list)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
             self.send_requested.emit()
             return
         super().keyPressEvent(event)
+
+    def insertFromMimeData(self, source):
+        paths = []
+        if source.hasUrls():
+            for url in source.urls():
+                if url.isLocalFile():
+                    paths.append(url.toLocalFile())
+            if paths:
+                self.files_attached.emit(paths)
+                return
+
+        if source.hasImage():
+            image = source.imageData()
+            if image is not None:
+                target = Path(tempfile.gettempdir()) / f"gemini-paste-{uuid.uuid4().hex}.png"
+                if image.save(str(target), "PNG"):
+                    self.files_attached.emit([str(target)])
+                    return
+
+        super().insertFromMimeData(source)
+
+
+class DropFileList(QListWidget):
+    files_dropped = Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QListWidget.DropOnly)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
 
 class GeminiWorker(QThread):
@@ -128,26 +182,49 @@ class GeminiWorker(QThread):
             content = [{"type": "text", "text": prompt_text}]
 
             for path in self.files:
+                file_path = Path(path)
                 mime, _ = mimetypes.guess_type(path)
                 mime = mime or "application/octet-stream"
+                raw = file_path.read_bytes()
+                b64 = base64.b64encode(raw).decode("ascii")
+                data_url = f"data:{mime};base64,{b64}"
+
                 if mime.startswith("image/"):
-                    data = base64.b64encode(Path(path).read_bytes()).decode("ascii")
                     content.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{data}"}
+                        "image_url": {"url": data_url}
+                    })
+                elif mime.startswith("video/"):
+                    content.append({
+                        "type": "video_url",
+                        "video_url": {"url": data_url}
+                    })
+                elif mime.startswith("audio/"):
+                    content.append({
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": b64,
+                            "format": file_path.suffix.lower().lstrip(".") or "wav"
+                        }
+                    })
+                elif mime.startswith("text/") or file_path.suffix.lower() in {
+                    ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".cs",
+                    ".cpp", ".c", ".h", ".hpp", ".html", ".css", ".json", ".xml",
+                    ".yaml", ".yml", ".md", ".txt", ".sql", ".sh", ".ps1", ".bat"
+                }:
+                    text = raw.decode("utf-8", errors="replace")
+                    content.append({
+                        "type": "text",
+                        "text": f"\n\n--- 附件: {file_path.name} ---\n{text[:500000]}"
                     })
                 else:
-                    try:
-                        text = Path(path).read_text(encoding="utf-8", errors="replace")
-                        content.append({
-                            "type": "text",
-                            "text": f"\n\n--- 附件: {Path(path).name} ---\n{text[:500000]}"
-                        })
-                    except Exception:
-                        content.append({
-                            "type": "text",
-                            "text": f"\n\n[无法按文本读取附件: {Path(path).name}]"
-                        })
+                    content.append({
+                        "type": "file",
+                        "file": {
+                            "filename": file_path.name,
+                            "file_data": data_url
+                        }
+                    })
 
             messages.append({"role": "user", "content": content})
 
@@ -297,16 +374,21 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.system_prompt)
 
         ll.addWidget(QLabel("本次附件 / 项目上下文"))
-        self.file_list = QListWidget()
-        self.file_list.setMaximumHeight(170)
+        self.file_list = DropFileList()
+        self.file_list.setMaximumHeight(190)
+        self.file_list.setToolTip("可拖入图片、视频、音频、PDF、源码、压缩包等文件")
+        self.file_list.files_dropped.connect(self.attach_paths)
         ll.addWidget(self.file_list)
 
         row = QHBoxLayout()
         add_btn = QPushButton("添加文件")
         add_btn.clicked.connect(self.add_files)
+        paste_btn = QPushButton("粘贴图片")
+        paste_btn.clicked.connect(self.paste_clipboard)
         rm_btn = QPushButton("移除")
         rm_btn.clicked.connect(self.remove_files)
         row.addWidget(add_btn)
+        row.addWidget(paste_btn)
         row.addWidget(rm_btn)
         ll.addLayout(row)
         ll.addStretch()
@@ -326,11 +408,45 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.chat = QTextBrowser()
+
+        code_page = QWidget()
+        code_layout = QVBoxLayout(code_page)
+        code_bar = QHBoxLayout()
+        code_hint = QLabel("代码可直接编辑；HTML/CSS/JS 可刷新到“可视化”预览")
+        code_bar.addWidget(code_hint)
+        code_bar.addStretch()
+        preview_btn = QPushButton("刷新可视化")
+        preview_btn.clicked.connect(self.refresh_visual_preview)
+        code_bar.addWidget(preview_btn)
+        code_layout.addLayout(code_bar)
+
         self.raw = QTextEdit()
-        self.raw.setReadOnly(True)
+        self.raw.setReadOnly(False)
         self.raw.setFont(QFont("Consolas", 10))
+        code_layout.addWidget(self.raw)
+
+        visual_page = QWidget()
+        visual_layout = QVBoxLayout(visual_page)
+        visual_bar = QHBoxLayout()
+        self.visual_status = QLabel("等待 HTML 内容")
+        visual_bar.addWidget(self.visual_status)
+        visual_bar.addStretch()
+        visual_refresh = QPushButton("刷新预览")
+        visual_refresh.clicked.connect(self.refresh_visual_preview)
+        visual_bar.addWidget(visual_refresh)
+        visual_layout.addLayout(visual_bar)
+        self.web_preview = QWebEngineView()
+        self.web_preview.setHtml(
+            "<html><body style='font-family:Segoe UI;padding:32px;color:#666'>"
+            "<h3>可视化预览</h3><p>AI 返回 HTML 后，这里会显示实时界面效果。</p>"
+            "<p>也可以在“代码”页修改 HTML，再点击“刷新可视化”。</p>"
+            "</body></html>"
+        )
+        visual_layout.addWidget(self.web_preview)
+
         self.tabs.addTab(self.chat, "对话")
-        self.tabs.addTab(self.raw, "原始输出 / 代码")
+        self.tabs.addTab(code_page, "代码")
+        self.tabs.addTab(visual_page, "可视化")
         rl.addWidget(self.tabs, 1)
 
         self.prompt = SendTextEdit()
@@ -338,6 +454,8 @@ class MainWindow(QMainWindow):
             "输入开发需求。Enter 发送，Shift+Enter 换行。"
         )
         self.prompt.send_requested.connect(self.send_prompt)
+        self.prompt.files_attached.connect(self.attach_paths)
+        self.prompt.setAcceptDrops(True)
         self.prompt.setMaximumHeight(150)
         rl.addWidget(self.prompt)
 
@@ -398,12 +516,45 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "添加上下文文件", "", "All files (*.*)")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "添加上下文文件",
+            "",
+            "所有支持文件 (*.*);;图片 (*.png *.jpg *.jpeg *.webp *.gif *.bmp);;"
+            "视频 (*.mp4 *.mov *.avi *.mkv *.webm);;音频 (*.mp3 *.wav *.m4a *.aac *.flac);;"
+            "文档 (*.pdf *.doc *.docx *.xls *.xlsx *.ppt *.pptx *.txt *.md);;"
+            "源码 (*.py *.js *.ts *.tsx *.jsx *.html *.css *.json *.java *.kt *.cs *.cpp *.c *.h)"
+        )
+        self.attach_paths(paths)
+
+    def attach_paths(self, paths):
         for p in paths:
-            if p not in self.files:
+            if p and Path(p).exists() and p not in self.files:
                 self.files.append(p)
-                self.file_list.addItem(Path(p).name)
+                mime, _ = mimetypes.guess_type(p)
+                label = Path(p).name
+                if mime:
+                    label += f"   [{mime}]"
+                self.file_list.addItem(label)
         self.update_context()
+
+    def paste_clipboard(self):
+        mime = QApplication.clipboard().mimeData()
+        paths = []
+        if mime.hasUrls():
+            paths = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+        if paths:
+            self.attach_paths(paths)
+            return
+        if mime.hasImage():
+            image = QApplication.clipboard().image()
+            if not image.isNull():
+                target = Path(tempfile.gettempdir()) / f"gemini-paste-{uuid.uuid4().hex}.png"
+                if image.save(str(target), "PNG"):
+                    self.attach_paths([str(target)])
+                    self.statusBar().showMessage("已粘贴图片到附件", 3000)
+                    return
+        QMessageBox.information(self, "剪贴板", "剪贴板中没有图片或本地文件。")
 
     def remove_files(self):
         rows = sorted({self.file_list.row(i) for i in self.file_list.selectedItems()}, reverse=True)
@@ -470,6 +621,38 @@ class MainWindow(QMainWindow):
         self.send_btn.setText("发送给 Gemini")
         self.statusBar().showMessage("生成完成", 4000)
         self.refresh_chat()
+        self.refresh_visual_preview()
+
+    def extract_html(self, text):
+        if not text:
+            return ""
+        matches = re.findall(r"\`\`\`(?:html)?\s*(.*?)\`\`\`", text, flags=re.I | re.S)
+        for block in matches:
+            candidate = block.strip()
+            if "<html" in candidate.lower() or "<body" in candidate.lower() or "<div" in candidate.lower():
+                return candidate
+
+        stripped = text.strip()
+        lower = stripped.lower()
+        if lower.startswith("<!doctype html") or "<html" in lower:
+            return stripped
+        return ""
+
+    def refresh_visual_preview(self):
+        code = self.raw.toPlainText().strip()
+        html = self.extract_html(code)
+        if not html:
+            self.visual_status.setText("未检测到可预览的 HTML")
+            self.web_preview.setHtml(
+                "<html><body style='font-family:Segoe UI;padding:32px;color:#666'>"
+                "<h3>暂无可视化内容</h3>"
+                "<p>“可视化”目前直接渲染 HTML/CSS/JavaScript。</p>"
+                "<p>让 AI 生成网页/UI 代码，或在“代码”页粘贴完整 HTML 后点击刷新。</p>"
+                "</body></html>"
+            )
+            return
+        self.web_preview.setHtml(html)
+        self.visual_status.setText("HTML 可视化预览已更新")
 
     def on_error(self, text):
         if self.history and self.history[-1].role == "user":
