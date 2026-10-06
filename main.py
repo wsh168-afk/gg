@@ -229,8 +229,8 @@ class GeminiWorker(QThread):
             messages.append({"role": "user", "content": content})
 
             api_model = self.model
-            if self.model.strip().lower() == "gemini 3.8 flash":
-                api_model = "gemini-3.8-flash"
+            if self.model.strip().lower() == "gemini-3-flash-preview":
+                api_model = "gemini-3-flash-preview"
 
             payload = {
                 "model": api_model,
@@ -320,12 +320,26 @@ class MainWindow(QMainWindow):
         ll.addWidget(title)
 
         form = QFormLayout()
+        api_key_row = QHBoxLayout()
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.Password)
-        self.api_key.setPlaceholderText("输入 Gemini API Key")
-        form.addRow("API Key", self.api_key)
+        self.api_key.setPlaceholderText("输入 API Key")
+        api_key_row.addWidget(self.api_key, 1)
 
-        self.remember = QCheckBox("仅在本机记住 API Key")
+        self.show_key_btn = QPushButton("显示")
+        self.show_key_btn.setCheckable(True)
+        self.show_key_btn.setFixedWidth(58)
+        self.show_key_btn.toggled.connect(self.toggle_api_key_visibility)
+        api_key_row.addWidget(self.show_key_btn)
+
+        self.test_key_btn = QPushButton("测试")
+        self.test_key_btn.setFixedWidth(58)
+        self.test_key_btn.clicked.connect(self.test_api_key)
+        api_key_row.addWidget(self.test_key_btn)
+
+        form.addRow("API Key", api_key_row)
+
+        self.remember = QCheckBox("仅保存在本机设置中")
         form.addRow("", self.remember)
 
         self.model = QComboBox()
@@ -334,13 +348,13 @@ class MainWindow(QMainWindow):
             "gemini-2.5-flash",
             "gemini-2.5-pro",
             "gemini-2.0-flash",
-            "Gemini 3.8 Flash",
+            "gemini-3-flash-preview",
         ])
         self.model.currentTextChanged.connect(self.on_model_changed)
         form.addRow("模型", self.model)
 
         self.api_base = QLineEdit()
-        self.api_base.setPlaceholderText("留空 = Google 官方；第三方示例：https://api.cxhao.com")
+        self.api_base.setPlaceholderText("Google 官方请留空；自定义接口可填写完整域名")
         form.addRow("接口地址", self.api_base)
 
         self.temperature = QSlider(Qt.Horizontal)
@@ -373,7 +387,11 @@ class MainWindow(QMainWindow):
         )
         ll.addWidget(self.system_prompt)
 
-        ll.addWidget(QLabel("本次附件 / 项目上下文"))
+        ll.addWidget(QLabel("附件与项目上下文"))
+        file_help = QLabel("可拖入文件，也可在输入框直接 Ctrl+V 粘贴图片/文件")
+        file_help.setWordWrap(True)
+        file_help.setObjectName("helperText")
+        ll.addWidget(file_help)
         self.file_list = DropFileList()
         self.file_list.setMaximumHeight(190)
         self.file_list.setToolTip("可拖入图片、视频、音频、PDF、源码、压缩包等文件")
@@ -383,7 +401,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         add_btn = QPushButton("添加文件")
         add_btn.clicked.connect(self.add_files)
-        paste_btn = QPushButton("粘贴图片")
+        paste_btn = QPushButton("粘贴")
         paste_btn.clicked.connect(self.paste_clipboard)
         rm_btn = QPushButton("移除")
         rm_btn.clicked.connect(self.remove_files)
@@ -462,9 +480,14 @@ class MainWindow(QMainWindow):
         send_row = QHBoxLayout()
         clear_btn = QPushButton("清空上下文")
         clear_btn.clicked.connect(self.clear_history)
-        self.send_btn = QPushButton("发送给 Gemini")
+        self.send_btn = QPushButton("发送")
         self.send_btn.clicked.connect(self.send_prompt)
-        self.send_btn.setMinimumHeight(38)
+        self.send_btn.setMinimumHeight(40)
+        self.send_btn.setStyleSheet(
+            "QPushButton { background:#2563eb; color:white; border:none; font-weight:600; padding:7px 20px; }"
+            "QPushButton:hover { background:#1d4ed8; }"
+            "QPushButton:disabled { background:#9ca3af; }"
+        )
         send_row.addWidget(clear_btn)
         send_row.addStretch()
         send_row.addWidget(self.send_btn)
@@ -474,8 +497,57 @@ class MainWindow(QMainWindow):
         root.setStretchFactor(1, 1)
         self.statusBar().showMessage("就绪")
 
+    def toggle_api_key_visibility(self, checked):
+        self.api_key.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        self.show_key_btn.setText("隐藏" if checked else "显示")
+
+    def test_api_key(self):
+        key = self.api_key.text().strip()
+        if not key:
+            QMessageBox.warning(self, "缺少 API Key", "请先输入 API Key。")
+            return
+
+        model = self.model.currentText().strip() or DEFAULT_MODEL
+        api_base = self.api_base.text().strip()
+
+        self.test_key_btn.setEnabled(False)
+        self.test_key_btn.setText("测试中")
+        self.statusBar().showMessage("正在测试 API 连接…")
+
+        history = []
+        worker = GeminiWorker(
+            key,
+            model,
+            api_base,
+            history,
+            "只回复：OK",
+            [],
+            "",
+            0.1,
+            0.9,
+            20,
+            64,
+        )
+
+        def ok(_):
+            self.test_key_btn.setEnabled(True)
+            self.test_key_btn.setText("测试")
+            self.statusBar().showMessage("API 连接成功", 5000)
+            QMessageBox.information(self, "连接成功", "API Key 与当前模型连接正常。")
+
+        def fail(msg):
+            self.test_key_btn.setEnabled(True)
+            self.test_key_btn.setText("测试")
+            self.statusBar().showMessage("API 连接失败", 5000)
+            QMessageBox.warning(self, "连接失败", msg)
+
+        worker.completed.connect(ok)
+        worker.failed.connect(fail)
+        self._test_worker = worker
+        worker.start()
+
     def on_model_changed(self, text):
-        if text.strip().lower() == "gemini 3.8 flash":
+        if text.strip().lower() == "gemini-3-flash-preview":
             self.api_base.setText("https://api.cxhao.com")
         elif self.api_base.text().strip().rstrip("/") == "https://api.cxhao.com":
             self.api_base.clear()
@@ -484,7 +556,7 @@ class MainWindow(QMainWindow):
         self.model.setCurrentText(self.settings.value("model", DEFAULT_MODEL))
         self.system_prompt.setPlainText(self.settings.value("system_prompt", ""))
         self.api_base.setText(self.settings.value("api_base", ""))
-        if self.model.currentText().strip().lower() == "gemini 3.8 flash" and not self.api_base.text().strip():
+        if self.model.currentText().strip().lower() == "gemini-3-flash-preview" and not self.api_base.text().strip():
             self.api_base.setText("https://api.cxhao.com")
         self.temperature.setValue(int(self.settings.value("temperature", 70)))
         self.top_p.setValue(int(self.settings.value("top_p", 95)))
@@ -618,7 +690,7 @@ class MainWindow(QMainWindow):
         self.files.clear()
         self.file_list.clear()
         self.send_btn.setEnabled(True)
-        self.send_btn.setText("发送给 Gemini")
+        self.send_btn.setText("发送")
         self.statusBar().showMessage("生成完成", 4000)
         self.refresh_chat()
         self.refresh_visual_preview()
@@ -744,6 +816,66 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
     app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QMainWindow, QWidget {
+            font-family: "Microsoft YaHei UI", "Segoe UI";
+            font-size: 13px;
+        }
+        QMainWindow { background: #f6f7fb; }
+        QToolBar {
+            spacing: 8px;
+            padding: 7px 10px;
+            border: none;
+            border-bottom: 1px solid #dfe3ea;
+            background: #ffffff;
+        }
+        QToolButton {
+            padding: 7px 10px;
+            border-radius: 6px;
+        }
+        QToolButton:hover { background: #eef3ff; }
+        QLabel#helperText { color: #6b7280; font-size: 12px; }
+        QLineEdit, QTextEdit, QTextBrowser, QListWidget, QComboBox, QSpinBox {
+            background: #ffffff;
+            border: 1px solid #d6dbe5;
+            border-radius: 7px;
+            padding: 6px;
+            selection-background-color: #2563eb;
+        }
+        QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QComboBox:focus {
+            border: 1px solid #2563eb;
+        }
+        QPushButton {
+            min-height: 30px;
+            padding: 4px 12px;
+            border-radius: 7px;
+            border: 1px solid #cfd5df;
+            background: #ffffff;
+        }
+        QPushButton:hover { background: #f2f5fa; }
+        QPushButton:pressed { background: #e8edf5; }
+        QTabWidget::pane {
+            border: 1px solid #d7dce5;
+            background: #ffffff;
+            border-radius: 8px;
+        }
+        QTabBar::tab {
+            padding: 8px 16px;
+            margin-right: 3px;
+            border-top-left-radius: 7px;
+            border-top-right-radius: 7px;
+            background: #e9edf4;
+        }
+        QTabBar::tab:selected {
+            color: #1557d6;
+            background: #ffffff;
+            font-weight: 600;
+        }
+        QStatusBar {
+            background: #ffffff;
+            border-top: 1px solid #e2e6ed;
+        }
+    """)
     window = MainWindow()
     window.show()
     return app.exec()
