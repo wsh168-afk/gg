@@ -6,11 +6,13 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import tempfile
 import urllib.error
 import uuid
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -507,14 +509,86 @@ class GeminiWorker(QThread):
         self.top_k = top_k
         self.max_tokens = max_tokens
 
+    def expand_input_files(self):
+        expanded = []
+        temp_dirs = []
+        skip_parts = {
+            ".git", ".idea", ".vscode", "node_modules", "build", "dist",
+            ".gradle", "__pycache__", ".next", "target", "vendor"
+        }
+        text_exts = {
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".kts", ".cs",
+            ".cpp", ".c", ".h", ".hpp", ".html", ".htm", ".css", ".scss", ".sass",
+            ".json", ".xml", ".yaml", ".yml", ".md", ".txt", ".sql", ".sh", ".ps1",
+            ".bat", ".cmd", ".toml", ".ini", ".cfg", ".conf", ".properties",
+            ".gradle", ".dart", ".go", ".rs", ".php", ".rb", ".swift", ".vue",
+            ".svelte", ".env", ".gitignore", ".dockerignore"
+        }
+
+        for original in self.files:
+            p = Path(original)
+            if p.suffix.lower() != ".zip":
+                expanded.append(str(p))
+                continue
+
+            try:
+                out = Path(tempfile.mkdtemp(prefix="gemini-zip-"))
+                temp_dirs.append(out)
+                with zipfile.ZipFile(p, "r") as zf:
+                    safe_members = []
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        member = Path(info.filename)
+                        if member.is_absolute() or ".." in member.parts:
+                            continue
+                        if any(part.lower() in skip_parts for part in member.parts):
+                            continue
+                        if info.file_size > 20 * 1024 * 1024:
+                            continue
+                        safe_members.append(info)
+                        if len(safe_members) >= 600:
+                            break
+
+                    for info in safe_members:
+                        target = out / info.filename
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(info, "r") as src, open(target, "wb") as dst:
+                            dst.write(src.read())
+
+                candidates = []
+                for file in out.rglob("*"):
+                    if not file.is_file():
+                        continue
+                    suffix = file.suffix.lower()
+                    mime, _ = mimetypes.guess_type(str(file))
+                    mime = mime or ""
+                    if (
+                        suffix in text_exts
+                        or mime.startswith("image/")
+                        or mime.startswith("video/")
+                        or mime.startswith("audio/")
+                        or mime == "application/pdf"
+                    ):
+                        candidates.append(str(file))
+
+                candidates.sort(key=lambda x: (Path(x).suffix.lower() not in text_exts, len(x), x))
+                expanded.extend(candidates[:300])
+            except Exception as e:
+                raise RuntimeError(f"无法解压项目 {p.name}：{e}")
+
+        return expanded, temp_dirs
+
     def run(self):
         if self.api_base:
             self.run_openai_compatible()
             return
 
         uploaded = []
+        temp_dirs = []
         try:
             client = genai.Client(api_key=self.api_key)
+            input_files, temp_dirs = self.expand_input_files()
             contents = []
             for m in self.history:
                 role = "model" if m.role == "assistant" else "user"
@@ -526,7 +600,7 @@ class GeminiWorker(QThread):
             parts = [types.Part.from_text(
                 text=self.prompt or "请分析附件并给出结果。"
             )]
-            for f in self.files:
+            for f in input_files:
                 obj = client.files.upload(file=f)
                 uploaded.append(obj)
                 parts.append(obj)
@@ -560,9 +634,16 @@ class GeminiWorker(QThread):
                         client.files.delete(name=obj.name)
             except Exception:
                 pass
+            for d in temp_dirs:
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
 
     def run_openai_compatible(self):
+        temp_dirs = []
         try:
+            input_files, temp_dirs = self.expand_input_files()
             messages = []
             if self.system_instruction:
                 messages.append({"role": "system", "content": self.system_instruction})
@@ -574,7 +655,7 @@ class GeminiWorker(QThread):
             prompt_text = self.prompt or "请分析附件并给出结果。"
             content = [{"type": "text", "text": prompt_text}]
 
-            for path in self.files:
+            for path in input_files:
                 file_path = Path(path)
                 mime, _ = mimetypes.guess_type(path)
                 mime = mime or "application/octet-stream"
@@ -610,13 +691,18 @@ class GeminiWorker(QThread):
                         "type": "text",
                         "text": f"\n\n--- 附件: {file_path.name} ---\n{text[:500000]}"
                     })
-                else:
+                elif mime == "application/pdf":
                     content.append({
                         "type": "file",
                         "file": {
                             "filename": file_path.name,
                             "file_data": data_url
                         }
+                    })
+                else:
+                    content.append({
+                        "type": "text",
+                        "text": f"\n[已跳过接口不支持的附件类型：{file_path.name} ({mime})]"
                     })
 
             messages.append({"role": "user", "content": content})
@@ -664,9 +750,22 @@ class GeminiWorker(QThread):
 
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            self.failed.emit(f"第三方 API 请求失败 HTTP {e.code}:\n{body}")
+            if "mime type is not supported" in body.lower():
+                self.failed.emit(
+                    "附件中包含当前模型接口不支持的文件类型。\n"
+                    "新版会自动解压 ZIP 并只发送模型支持的源码、图片、视频、音频和 PDF。\n\n"
+                    f"接口返回：HTTP {e.code}"
+                )
+            else:
+                self.failed.emit(f"第三方 API 请求失败 HTTP {e.code}:\n{body[:1500]}")
         except Exception as e:
             self.failed.emit(f"第三方 API 请求失败：\n{e}")
+        finally:
+            for d in temp_dirs:
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
 
 
 class MainWindow(QMainWindow):
@@ -1226,7 +1325,9 @@ class MainWindow(QMainWindow):
                 self.files.append(p)
                 mime, _ = mimetypes.guess_type(p)
                 label = Path(p).name
-                if mime:
+                if Path(p).suffix.lower() == ".zip":
+                    label += "   [项目压缩包 · 自动解压]"
+                elif mime:
                     label += f"   [{mime}]"
                 self.file_list.addItem(label)
         self.update_context()
