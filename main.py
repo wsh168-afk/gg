@@ -1449,12 +1449,20 @@ class MainWindow(QMainWindow):
         self.visual_status.setText("HTML 可视化预览已更新")
 
     def on_error(self, text):
-        if self.history and self.history[-1].role == "user":
-            self.history.pop()
         self.send_btn.setEnabled(True)
-        self.send_btn.setText("发送给 Gemini")
-        self.raw.setPlainText(text)
-        QMessageBox.critical(self, "Gemini API 请求失败", text)
+        self.send_btn.setText("发送")
+
+        error_record = f"【请求失败】\n{text}"
+        self.history.append(ChatMessage("assistant", error_record))
+
+        self.raw.setPlainText(error_record)
+        self.statusBar().showMessage("请求失败，指令与错误记录已保留", 6000)
+
+        QMessageBox.critical(
+            self,
+            "Gemini API 请求失败",
+            f"{text}\n\n本次指令和错误信息已保留在对话中，附件也不会被清空。"
+        )
         self.refresh_chat()
 
     @staticmethod
