@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,16 +30,27 @@ class ChatMessage:
     role: str
     text: str
 
+class SendTextEdit(QTextEdit):
+    send_requested = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+            self.send_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+
 class GeminiWorker(QThread):
     chunk = Signal(str)
     completed = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, api_key, model, history, prompt, files, system_instruction,
+    def __init__(self, api_key, model, api_base, history, prompt, files, system_instruction,
                  temperature, top_p, top_k, max_tokens):
         super().__init__()
         self.api_key = api_key
         self.model = model
+        self.api_base = (api_base or "").strip().rstrip("/")
         self.history = history
         self.prompt = prompt
         self.files = files
@@ -46,6 +61,10 @@ class GeminiWorker(QThread):
         self.max_tokens = max_tokens
 
     def run(self):
+        if self.api_base:
+            self.run_openai_compatible()
+            return
+
         uploaded = []
         try:
             client = genai.Client(api_key=self.api_key)
@@ -94,6 +113,91 @@ class GeminiWorker(QThread):
                         client.files.delete(name=obj.name)
             except Exception:
                 pass
+
+    def run_openai_compatible(self):
+        try:
+            messages = []
+            if self.system_instruction:
+                messages.append({"role": "system", "content": self.system_instruction})
+
+            for m in self.history:
+                role = "assistant" if m.role == "assistant" else "user"
+                messages.append({"role": role, "content": m.text})
+
+            prompt_text = self.prompt or "请分析附件并给出结果。"
+            content = [{"type": "text", "text": prompt_text}]
+
+            for path in self.files:
+                mime, _ = mimetypes.guess_type(path)
+                mime = mime or "application/octet-stream"
+                if mime.startswith("image/"):
+                    data = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{data}"}
+                    })
+                else:
+                    try:
+                        text = Path(path).read_text(encoding="utf-8", errors="replace")
+                        content.append({
+                            "type": "text",
+                            "text": f"\n\n--- 附件: {Path(path).name} ---\n{text[:500000]}"
+                        })
+                    except Exception:
+                        content.append({
+                            "type": "text",
+                            "text": f"\n\n[无法按文本读取附件: {Path(path).name}]"
+                        })
+
+            messages.append({"role": "user", "content": content})
+
+            api_model = self.model
+            if self.model.strip().lower() == "gemini 3.8 flash":
+                api_model = "gemini-3.8-flash"
+
+            payload = {
+                "model": api_model,
+                "messages": messages,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "max_tokens": self.max_tokens,
+                "stream": False,
+            }
+
+            url = self.api_base
+            if not url.endswith("/v1/chat/completions"):
+                url += "/v1/chat/completions"
+
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            text = data["choices"][0]["message"]["content"]
+            if isinstance(text, list):
+                text = "".join(
+                    item.get("text", "") if isinstance(item, dict) else str(item)
+                    for item in text
+                )
+            text = str(text)
+            self.chunk.emit(text)
+            self.completed.emit(text)
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            self.failed.emit(f"第三方 API 请求失败 HTTP {e.code}:\n{body}")
+        except Exception as e:
+            self.failed.emit(f"第三方 API 请求失败：\n{e}")
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -153,8 +257,14 @@ class MainWindow(QMainWindow):
             "gemini-2.5-flash",
             "gemini-2.5-pro",
             "gemini-2.0-flash",
+            "Gemini 3.8 Flash",
         ])
+        self.model.currentTextChanged.connect(self.on_model_changed)
         form.addRow("模型", self.model)
+
+        self.api_base = QLineEdit()
+        self.api_base.setPlaceholderText("留空 = Google 官方；第三方示例：https://api.cxhao.com")
+        form.addRow("接口地址", self.api_base)
 
         self.temperature = QSlider(Qt.Horizontal)
         self.temperature.setRange(0, 200)
@@ -223,10 +333,11 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.raw, "原始输出 / 代码")
         rl.addWidget(self.tabs, 1)
 
-        self.prompt = QTextEdit()
+        self.prompt = SendTextEdit()
         self.prompt.setPlaceholderText(
-            "输入开发需求，例如：生成一个 FastAPI 登录模块，或分析左侧附件。"
+            "输入开发需求。Enter 发送，Shift+Enter 换行。"
         )
+        self.prompt.send_requested.connect(self.send_prompt)
         self.prompt.setMaximumHeight(150)
         rl.addWidget(self.prompt)
 
@@ -245,9 +356,18 @@ class MainWindow(QMainWindow):
         root.setStretchFactor(1, 1)
         self.statusBar().showMessage("就绪")
 
+    def on_model_changed(self, text):
+        if text.strip().lower() == "gemini 3.8 flash":
+            self.api_base.setText("https://api.cxhao.com")
+        elif self.api_base.text().strip().rstrip("/") == "https://api.cxhao.com":
+            self.api_base.clear()
+
     def load_settings(self):
         self.model.setCurrentText(self.settings.value("model", DEFAULT_MODEL))
         self.system_prompt.setPlainText(self.settings.value("system_prompt", ""))
+        self.api_base.setText(self.settings.value("api_base", ""))
+        if self.model.currentText().strip().lower() == "gemini 3.8 flash" and not self.api_base.text().strip():
+            self.api_base.setText("https://api.cxhao.com")
         self.temperature.setValue(int(self.settings.value("temperature", 70)))
         self.top_p.setValue(int(self.settings.value("top_p", 95)))
         self.top_k.setValue(int(self.settings.value("top_k", 40)))
@@ -261,6 +381,7 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         self.settings.setValue("model", self.model.currentText().strip())
+        self.settings.setValue("api_base", self.api_base.text().strip())
         self.settings.setValue("system_prompt", self.system_prompt.toPlainText())
         self.settings.setValue("temperature", self.temperature.value())
         self.settings.setValue("top_p", self.top_p.value())
@@ -319,6 +440,7 @@ class MainWindow(QMainWindow):
         self.worker = GeminiWorker(
             key,
             self.model.currentText().strip() or DEFAULT_MODEL,
+            self.api_base.text().strip(),
             previous,
             prompt,
             list(self.files),
