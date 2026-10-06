@@ -701,6 +701,16 @@ class MainWindow(QMainWindow):
             action.triggered.connect(fn)
             bar.addAction(action)
 
+        bar.addSeparator()
+        theme_label = QLabel("主题")
+        bar.addWidget(theme_label)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["浅色", "深色", "护眼", "灰蓝"])
+        self.theme_combo.setFixedWidth(88)
+        self.theme_combo.currentTextChanged.connect(self.apply_theme)
+        bar.addWidget(self.theme_combo)
+
         root = QSplitter(Qt.Horizontal)
         self.setCentralWidget(root)
 
@@ -894,6 +904,196 @@ class MainWindow(QMainWindow):
         root.setStretchFactor(1, 1)
         self.statusBar().showMessage("就绪")
 
+    def apply_theme(self, theme_name):
+        self.settings.setValue("theme", theme_name)
+
+        themes = {
+            "浅色": {
+                "window": "#edf1f7",
+                "panel": "#f7f9fc",
+                "card": "#ffffff",
+                "input": "#ffffff",
+                "text": "#182230",
+                "muted": "#667085",
+                "border": "#cfd6e2",
+                "tab": "#e6ebf3",
+                "tab_selected": "#ffffff",
+                "hover": "#edf3ff",
+                "pressed": "#e1e8f2",
+                "accent": "#2563eb",
+                "accent_hover": "#1d4ed8",
+                "assistant": "#ffffff",
+                "user": "#e9f0ff",
+            },
+            "深色": {
+                "window": "#17191d",
+                "panel": "#1e2127",
+                "card": "#23272f",
+                "input": "#1f232a",
+                "text": "#e8ebf0",
+                "muted": "#a7afbd",
+                "border": "#3a414c",
+                "tab": "#2a2f37",
+                "tab_selected": "#343a44",
+                "hover": "#303641",
+                "pressed": "#3a414c",
+                "accent": "#4f8cff",
+                "accent_hover": "#6b9cff",
+                "assistant": "#23272f",
+                "user": "#263449",
+            },
+            "护眼": {
+                "window": "#e9e6dc",
+                "panel": "#f0eee6",
+                "card": "#f7f5ee",
+                "input": "#f3f1e9",
+                "text": "#2d312c",
+                "muted": "#70756c",
+                "border": "#c9c6bb",
+                "tab": "#dedbd1",
+                "tab_selected": "#f7f5ee",
+                "hover": "#e8e4d8",
+                "pressed": "#ddd8ca",
+                "accent": "#4f7d5d",
+                "accent_hover": "#41694d",
+                "assistant": "#f7f5ee",
+                "user": "#e3ecdf",
+            },
+            "灰蓝": {
+                "window": "#1f2833",
+                "panel": "#26313d",
+                "card": "#2c3946",
+                "input": "#25313d",
+                "text": "#eef3f8",
+                "muted": "#aebdca",
+                "border": "#415161",
+                "tab": "#334252",
+                "tab_selected": "#3b4b5d",
+                "hover": "#38495a",
+                "pressed": "#435568",
+                "accent": "#5b9cf5",
+                "accent_hover": "#74adfa",
+                "assistant": "#2c3946",
+                "user": "#2e435a",
+            },
+        }
+
+        t = themes.get(theme_name, themes["护眼"])
+        QApplication.instance().setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                font-family: "Microsoft YaHei UI", "Segoe UI";
+                font-size: 13px;
+                color: {t['text']};
+                background: {t['window']};
+            }}
+            QToolBar {{
+                spacing: 8px;
+                padding: 7px 10px;
+                border: none;
+                border-bottom: 1px solid {t['border']};
+                background: {t['panel']};
+            }}
+            QToolButton {{
+                padding: 7px 10px;
+                border-radius: 6px;
+                color: {t['text']};
+            }}
+            QToolButton:hover {{
+                background: {t['hover']};
+            }}
+            QLabel {{
+                background: transparent;
+                color: {t['text']};
+            }}
+            QLabel#helperText {{
+                color: {t['muted']};
+                font-size: 12px;
+            }}
+            QLineEdit, QTextEdit, QTextBrowser, QListWidget, QTreeWidget,
+            QComboBox, QSpinBox {{
+                background: {t['input']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 7px;
+                padding: 6px;
+                selection-background-color: {t['accent']};
+                selection-color: #ffffff;
+            }}
+            QLineEdit:focus, QTextEdit:focus, QListWidget:focus,
+            QTreeWidget:focus, QComboBox:focus {{
+                border: 1px solid {t['accent']};
+            }}
+            QComboBox QAbstractItemView {{
+                background: {t['card']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                selection-background-color: {t['hover']};
+            }}
+            QPushButton {{
+                min-height: 30px;
+                padding: 4px 12px;
+                border-radius: 7px;
+                border: 1px solid {t['border']};
+                color: {t['text']};
+                background: {t['card']};
+            }}
+            QPushButton:hover {{
+                background: {t['hover']};
+            }}
+            QPushButton:pressed {{
+                background: {t['pressed']};
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {t['border']};
+                background: {t['card']};
+                border-radius: 8px;
+            }}
+            QTabBar::tab {{
+                padding: 8px 16px;
+                margin-right: 3px;
+                border-top-left-radius: 7px;
+                border-top-right-radius: 7px;
+                color: {t['text']};
+                background: {t['tab']};
+            }}
+            QTabBar::tab:selected {{
+                color: {t['accent']};
+                background: {t['tab_selected']};
+                font-weight: 600;
+            }}
+            QStatusBar {{
+                background: {t['panel']};
+                color: {t['text']};
+                border-top: 1px solid {t['border']};
+            }}
+            QSplitter::handle {{
+                background: {t['border']};
+            }}
+            QScrollBar:vertical {{
+                background: {t['panel']};
+                width: 12px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {t['border']};
+                min-height: 28px;
+                border-radius: 5px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+
+        self.send_btn.setStyleSheet(
+            f"QPushButton {{ background:{t['accent']}; color:white; border:none; "
+            "font-weight:600; padding:7px 20px; border-radius:7px; }}"
+            f"QPushButton:hover {{ background:{t['accent_hover']}; }}"
+            "QPushButton:disabled { background:#7a7f87; color:#d7d7d7; }"
+        )
+
+        self._theme_colors = t
+        self.refresh_chat()
+
     def toggle_api_key_visibility(self, checked):
         self.api_key.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
         self.show_key_btn.setText("隐藏" if checked else "显示")
@@ -952,6 +1152,14 @@ class MainWindow(QMainWindow):
         else:
             self.repo_label.setText("GitHub：未绑定")
 
+        theme = self.settings.value("theme", "护眼")
+        idx = self.theme_combo.findText(theme)
+        if idx >= 0:
+            self.theme_combo.setCurrentIndex(idx)
+        else:
+            self.theme_combo.setCurrentText("护眼")
+        self.apply_theme(self.theme_combo.currentText())
+
     def on_model_changed(self, text):
         if text.strip().lower() == "gemini-3.8-flash":
             self.api_base.setText("https://api.cxhao.com")
@@ -989,6 +1197,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("top_p", self.top_p.value())
         self.settings.setValue("top_k", self.top_k.value())
         self.settings.setValue("max_tokens", self.max_tokens.value())
+        self.settings.setValue("theme", self.theme_combo.currentText())
         self.settings.setValue("remember_key", self.remember.isChecked())
         if self.remember.isChecked():
             self.settings.setValue("api_key", self.api_key.text().strip())
@@ -1154,16 +1363,22 @@ class MainWindow(QMainWindow):
 
     def refresh_chat(self, streaming=""):
         blocks = []
+        colors = getattr(self, "_theme_colors", {
+            "user": "#e9f0ff",
+            "assistant": "#ffffff",
+            "text": "#182230",
+            "border": "#cfd6e2",
+        })
         for m in self.history:
             who = "你" if m.role == "user" else "Gemini"
-            bg = "#eef3fd" if m.role == "user" else "#ffffff"
+            bg = colors["user"] if m.role == "user" else colors["assistant"]
             blocks.append(
-                f"<div style='background:{bg};border:1px solid #ddd;border-radius:10px;"
+                f"<div style='background:{bg};color:{colors['text']};border:1px solid {colors['border']};border-radius:10px;"
                 f"padding:12px;margin:8px'><b>{who}</b><br><br>{self.esc(m.text)}</div>"
             )
         if streaming:
             blocks.append(
-                "<div style='background:#fff;border:1px solid #ddd;border-radius:10px;"
+                f"<div style='background:{colors['assistant']};color:{colors['text']};border:1px solid {colors['border']};border-radius:10px;"
                 f"padding:12px;margin:8px'><b>Gemini</b><br><br>{self.esc(streaming)}</div>"
             )
         self.chat.setHtml("".join(blocks))
@@ -1228,66 +1443,6 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
     app.setStyle("Fusion")
-    app.setStyleSheet("""
-        QMainWindow, QWidget {
-            font-family: "Microsoft YaHei UI", "Segoe UI";
-            font-size: 13px;
-        }
-        QMainWindow { background: #f6f7fb; }
-        QToolBar {
-            spacing: 8px;
-            padding: 7px 10px;
-            border: none;
-            border-bottom: 1px solid #dfe3ea;
-            background: #ffffff;
-        }
-        QToolButton {
-            padding: 7px 10px;
-            border-radius: 6px;
-        }
-        QToolButton:hover { background: #eef3ff; }
-        QLabel#helperText { color: #6b7280; font-size: 12px; }
-        QLineEdit, QTextEdit, QTextBrowser, QListWidget, QComboBox, QSpinBox {
-            background: #ffffff;
-            border: 1px solid #d6dbe5;
-            border-radius: 7px;
-            padding: 6px;
-            selection-background-color: #2563eb;
-        }
-        QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QComboBox:focus {
-            border: 1px solid #2563eb;
-        }
-        QPushButton {
-            min-height: 30px;
-            padding: 4px 12px;
-            border-radius: 7px;
-            border: 1px solid #cfd5df;
-            background: #ffffff;
-        }
-        QPushButton:hover { background: #f2f5fa; }
-        QPushButton:pressed { background: #e8edf5; }
-        QTabWidget::pane {
-            border: 1px solid #d7dce5;
-            background: #ffffff;
-            border-radius: 8px;
-        }
-        QTabBar::tab {
-            padding: 8px 16px;
-            margin-right: 3px;
-            border-top-left-radius: 7px;
-            border-top-right-radius: 7px;
-            background: #e9edf4;
-        }
-        QTabBar::tab:selected {
-            color: #1557d6;
-            background: #ffffff;
-            font-weight: 600;
-        }
-        QStatusBar {
-            background: #ffffff;
-            border-top: 1px solid #e2e6ed;
-        }
-    """)
     window = MainWindow()
     window.show()
     return app.exec()
