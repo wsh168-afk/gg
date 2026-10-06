@@ -32,6 +32,10 @@ jobs:
         run: |
           python -c "import PySide6; from PySide6 import QtCore, QtGui, QtWidgets, QtWebEngineWidgets; from google import genai; print('PySide6 OK:', PySide6.__version__); print('QtWebEngine OK'); print('google-genai OK')"
 
+      - name: Verify Python syntax
+        run: |
+          python -m py_compile main.py
+
       - name: Build EXE
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed --name GeminiDevStudio --hidden-import PySide6.QtCore --hidden-import PySide6.QtGui --hidden-import PySide6.QtWidgets --hidden-import PySide6.QtWebEngineWidgets --collect-all PySide6.QtWebEngineCore --collect-all PySide6.QtWebEngineWidgets main.py
