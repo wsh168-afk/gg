@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import difflib
 import json
 import mimetypes
@@ -16,11 +17,11 @@ import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QFont, QTextCursor
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QFont, QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget, QTextBrowser,
     QTextEdit, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -912,7 +913,8 @@ class MainWindow(QMainWindow):
         file_help.setObjectName("helperText")
         ll.addWidget(file_help)
         self.file_list = DropFileList()
-        self.file_list.setMaximumHeight(190)
+        self.file_list.setMaximumHeight(220)
+        self.file_list.setIconSize(QSize(72, 54))
         self.file_list.setToolTip("可拖入图片、视频、音频、PDF、源码、压缩包等文件")
         self.file_list.files_dropped.connect(self.attach_paths)
         ll.addWidget(self.file_list)
@@ -947,7 +949,7 @@ class MainWindow(QMainWindow):
         rl.addLayout(head)
 
         self.tabs = QTabWidget()
-        self.chat = QTextBrowser()
+        self.chat = QWebEngineView()
 
         code_page = QWidget()
         code_layout = QVBoxLayout(code_page)
@@ -1352,12 +1354,30 @@ class MainWindow(QMainWindow):
             if p and Path(p).exists() and p not in self.files:
                 self.files.append(p)
                 mime, _ = mimetypes.guess_type(p)
+                mime = mime or "application/octet-stream"
                 label = Path(p).name
+
                 if Path(p).suffix.lower() == ".zip":
                     label += "   [项目压缩包 · 自动解压]"
-                elif mime:
+                elif mime.startswith("image/"):
+                    label += "   [图片]"
+                elif mime.startswith("video/"):
+                    label += "   [视频]"
+                elif mime.startswith("audio/"):
+                    label += "   [音频]"
+                elif mime == "application/pdf":
+                    label += "   [PDF]"
+                else:
                     label += f"   [{mime}]"
-                self.file_list.addItem(label)
+
+                item = QListWidgetItem(label)
+                item.setToolTip(str(Path(p).resolve()))
+                if mime.startswith("image/"):
+                    pix = QPixmap(p)
+                    if not pix.isNull():
+                        thumb = pix.scaled(72, 54, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        item.setIcon(QIcon(thumb))
+                self.file_list.addItem(item)
         self.update_context()
 
     def paste_clipboard(self):
@@ -1520,31 +1540,159 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def esc(text):
-        return (text.replace("&", "&amp;").replace("<", "&lt;")
-                    .replace(">", "&gt;").replace("\n", "<br>"))
+        return html.escape(text or "")
 
-    def refresh_chat(self, streaming=""):
-        blocks = []
+    def render_markdownish(self, text):
+        text = text or ""
+        parts = []
+        pos = 0
+        code_re = re.compile(r"\`\`\`([A-Za-z0-9_+.-]*)\n?(.*?)\`\`\`", re.S)
+
+        for match in code_re.finditer(text):
+            before = text[pos:match.start()]
+            if before:
+                safe = html.escape(before)
+                safe = re.sub(r"(?m)^###\s+(.+)$", r"<h3>\1</h3>", safe)
+                safe = re.sub(r"(?m)^##\s+(.+)$", r"<h2>\1</h2>", safe)
+                safe = re.sub(r"(?m)^#\s+(.+)$", r"<h1>\1</h1>", safe)
+                safe = re.sub(r"(?m)^\s*[-*]\s+(.+)$", r"• \1", safe)
+                safe = safe.replace("\n", "<br>")
+                parts.append(f"<div class='prose'>{safe}</div>")
+
+            lang = html.escape(match.group(1) or "text")
+            code = match.group(2)
+            encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+            safe_code = html.escape(code)
+            parts.append(
+                "<div class='code-card'>"
+                f"<div class='code-head'><span>{lang}</span>"
+                f"<button onclick=\\"copyB64('{encoded}', this)\\">复制代码</button></div>"
+                f"<pre><code>{safe_code}</code></pre></div>"
+            )
+            pos = match.end()
+
+        tail = text[pos:]
+        if tail:
+            safe = html.escape(tail)
+            safe = re.sub(r"(?m)^###\s+(.+)$", r"<h3>\1</h3>", safe)
+            safe = re.sub(r"(?m)^##\s+(.+)$", r"<h2>\1</h2>", safe)
+            safe = re.sub(r"(?m)^#\s+(.+)$", r"<h1>\1</h1>", safe)
+            safe = re.sub(r"(?m)^\s*[-*]\s+(.+)$", r"• \1", safe)
+            safe = safe.replace("\n", "<br>")
+            parts.append(f"<div class='prose'>{safe}</div>")
+
+        return "".join(parts)
+
+    def chat_document(self, streaming=""):
         colors = getattr(self, "_theme_colors", {
             "user": "#e9f0ff",
             "assistant": "#ffffff",
             "text": "#182230",
             "border": "#cfd6e2",
+            "window": "#edf1f7",
+            "panel": "#f7f9fc",
+            "muted": "#667085",
+            "accent": "#2563eb",
         })
-        for m in self.history:
-            who = "你" if m.role == "user" else "Gemini"
-            bg = colors["user"] if m.role == "user" else colors["assistant"]
-            blocks.append(
-                f"<div style='background:{bg};color:{colors['text']};border:1px solid {colors['border']};border-radius:10px;"
-                f"padding:12px;margin:8px'><b>{who}</b><br><br>{self.esc(m.text)}</div>"
-            )
+
+        cards = []
+        messages = list(self.history)
         if streaming:
-            blocks.append(
-                f"<div style='background:{colors['assistant']};color:{colors['text']};border:1px solid {colors['border']};border-radius:10px;"
-                f"padding:12px;margin:8px'><b>Gemini</b><br><br>{self.esc(streaming)}</div>"
+            messages.append(ChatMessage("assistant", streaming))
+
+        for m in messages:
+            is_user = m.role == "user"
+            title = "你" if is_user else "Gemini"
+            bg = colors["user"] if is_user else colors["assistant"]
+            body = self.render_markdownish(m.text)
+            raw_b64 = base64.b64encode((m.text or "").encode("utf-8")).decode("ascii")
+
+            actions = ""
+            if not is_user:
+                actions = (
+                    f"<button class='copy-answer' onclick=\\"copyB64('{raw_b64}', this)\\">复制回答</button>"
+                )
+
+            if (not is_user) and len(m.text or "") > 1800:
+                body = (
+                    "<details class='fold'><summary>回答较长，点击展开全部</summary>"
+                    f"<div class='fold-body'>{body}</div></details>"
+                )
+
+            role_class = "user-card" if is_user else "assistant-card"
+            avatar = "你" if is_user else "G"
+            cards.append(
+                f"<section class='msg {role_class}' style='background:{bg};'>"
+                f"<div class='msg-head'><span class='avatar'>{avatar}</span>"
+                f"<strong>{title}</strong><span class='spacer'></span>{actions}</div>"
+                f"<div class='msg-body'>{body}</div></section>"
             )
-        self.chat.setHtml("".join(blocks))
-        self.chat.verticalScrollBar().setValue(self.chat.verticalScrollBar().maximum())
+
+        return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* {{ box-sizing:border-box; }}
+html,body {{ margin:0; padding:0; background:{colors['window']}; color:{colors['text']};
+font-family:'Microsoft YaHei UI','Segoe UI',sans-serif; }}
+body {{ padding:18px 22px 28px; }}
+.msg {{ max-width:960px; margin:0 auto 16px; border:1px solid {colors['border']};
+border-radius:16px; padding:14px 16px; box-shadow:0 1px 2px rgba(0,0,0,.04); }}
+.user-card {{ margin-left:auto; max-width:82%; }}
+.assistant-card {{ margin-right:auto; width:100%; }}
+.msg-head {{ display:flex; align-items:center; gap:9px; margin-bottom:10px; }}
+.avatar {{ width:28px; height:28px; border-radius:50%; display:inline-flex;
+align-items:center; justify-content:center; font-weight:700; color:white; background:{colors['accent']}; }}
+.user-card .avatar {{ background:#64748b; }}
+.spacer {{ flex:1; }}
+.msg-body {{ line-height:1.72; font-size:14px; }}
+.user-card .msg-body {{ font-weight:600; }}
+.assistant-card .msg-body {{ font-weight:400; }}
+.prose h1,.prose h2,.prose h3 {{ margin:14px 0 8px; line-height:1.35; }}
+.prose h1 {{ font-size:20px; }} .prose h2 {{ font-size:18px; }} .prose h3 {{ font-size:16px; }}
+button {{ border:1px solid {colors['border']}; background:{colors['panel']}; color:{colors['text']};
+border-radius:7px; padding:5px 9px; cursor:pointer; }}
+.code-card {{ margin:12px 0; border:1px solid {colors['border']}; border-radius:10px;
+overflow:hidden; background:#0f172a; }}
+.code-head {{ display:flex; justify-content:space-between; align-items:center; padding:7px 10px;
+background:#111827; color:#cbd5e1; font-size:12px; }}
+.code-head button {{ background:#243244; color:#e5e7eb; border-color:#3c4b5f; }}
+pre {{ margin:0; padding:13px 14px; overflow:auto; color:#e5e7eb; background:#0f172a;
+font-family:Consolas,'Courier New',monospace; font-size:13px; line-height:1.55; white-space:pre; }}
+.fold summary {{ cursor:pointer; color:{colors['accent']}; font-weight:600; padding:8px 0; }}
+.fold-body {{ margin-top:8px; }}
+.copy-answer {{ font-size:12px; }}
+</style>
+<script>
+function copyText(text, btn) {{
+  const ta=document.createElement('textarea');
+  ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  try {{
+    document.execCommand('copy');
+    const old=btn.innerText; btn.innerText='已复制';
+    setTimeout(()=>btn.innerText=old,1200);
+  }} catch(e) {{ btn.innerText='复制失败'; }}
+  document.body.removeChild(ta);
+}}
+function copyB64(b64, btn) {{
+  try {{
+    const bytes=Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
+    const text=new TextDecoder('utf-8').decode(bytes);
+    copyText(text, btn);
+  }} catch(e) {{ btn.innerText='复制失败'; }}
+}}
+</script>
+</head>
+<body>
+{''.join(cards)}
+</body>
+</html>"""
+
+    def refresh_chat(self, streaming=""):
+        self.chat.setHtml(self.chat_document(streaming))
+        self.chat.page().runJavaScript("window.scrollTo(0, document.body.scrollHeight);")
         self.update_context()
 
     def new_chat(self):
