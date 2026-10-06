@@ -969,22 +969,120 @@ class MainWindow(QMainWindow):
 
         visual_page = QWidget()
         visual_layout = QVBoxLayout(visual_page)
+        visual_layout.setContentsMargins(0, 0, 0, 0)
+
+        visual_split = QSplitter(Qt.Horizontal)
+
+        # 左侧：AI 对话与操作区
+        visual_left = QWidget()
+        visual_left.setMinimumWidth(310)
+        visual_left.setMaximumWidth(460)
+        visual_left_layout = QVBoxLayout(visual_left)
+        visual_left_layout.setContentsMargins(10, 10, 8, 10)
+
+        left_title_row = QHBoxLayout()
+        left_title = QLabel("✦ Gemini")
+        left_title.setStyleSheet("font-size:15px;font-weight:700;")
+        left_title_row.addWidget(left_title)
+        left_title_row.addStretch()
+        self.visual_model_label = QLabel(self.model.currentText())
+        self.visual_model_label.setObjectName("helperText")
+        left_title_row.addWidget(self.visual_model_label)
+        visual_left_layout.addLayout(left_title_row)
+
+        self.visual_chat = QWebEngineView()
+        self.visual_chat.setMinimumHeight(360)
+        visual_left_layout.addWidget(self.visual_chat, 1)
+
+        quick_row = QHBoxLayout()
+        for title, prompt_text in [
+            ("修复错误", "检查当前项目并修复应用程序中的错误"),
+            ("新增功能", "基于当前项目新增一个实用功能"),
+            ("优化界面", "优化当前应用界面和交互体验"),
+        ]:
+            btn = QPushButton(title)
+            btn.clicked.connect(lambda _=False, p=prompt_text: self.visual_quick_prompt(p))
+            quick_row.addWidget(btn)
+        visual_left_layout.addLayout(quick_row)
+
+        self.visual_prompt = SendTextEdit()
+        self.visual_prompt.setPlaceholderText("进行修改、添加新功能，提出任何要求…")
+        self.visual_prompt.setMaximumHeight(105)
+        self.visual_prompt.send_requested.connect(self.send_visual_prompt)
+        self.visual_prompt.files_attached.connect(self.attach_paths)
+        visual_left_layout.addWidget(self.visual_prompt)
+
+        visual_send_row = QHBoxLayout()
+        self.visual_attach_btn = QPushButton("＋")
+        self.visual_attach_btn.setFixedWidth(38)
+        self.visual_attach_btn.clicked.connect(self.add_files)
+        visual_send_row.addWidget(self.visual_attach_btn)
+        visual_send_row.addStretch()
+        self.visual_build_btn = QPushButton("构建")
+        self.visual_build_btn.clicked.connect(self.send_visual_prompt)
+        visual_send_row.addWidget(self.visual_build_btn)
+        visual_left_layout.addLayout(visual_send_row)
+
+        # 右侧：真实可视化画布
+        visual_right = QWidget()
+        visual_right_layout = QVBoxLayout(visual_right)
+        visual_right_layout.setContentsMargins(0, 0, 0, 0)
+
         visual_bar = QHBoxLayout()
-        self.visual_status = QLabel("等待 HTML 内容")
+        visual_bar.setContentsMargins(10, 8, 10, 8)
+
+        self.visual_status = QLabel("预览")
+        self.visual_status.setStyleSheet("font-weight:700;")
         visual_bar.addWidget(self.visual_status)
+
+        code_switch_btn = QPushButton("</>")
+        code_switch_btn.setToolTip("切换到代码")
+        code_switch_btn.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        visual_bar.addWidget(code_switch_btn)
+
         visual_bar.addStretch()
-        visual_refresh = QPushButton("刷新预览")
+
+        self.preview_device = QComboBox()
+        self.preview_device.addItems(["iPhone 16 Pro", "Android", "平板", "网页"])
+        self.preview_device.setFixedWidth(125)
+        self.preview_device.currentTextChanged.connect(self.refresh_visual_preview)
+        visual_bar.addWidget(self.preview_device)
+
+        self.preview_path = QLineEdit("/")
+        self.preview_path.setFixedWidth(170)
+        self.preview_path.setAlignment(Qt.AlignCenter)
+        visual_bar.addWidget(self.preview_path)
+
+        visual_refresh = QPushButton("↻")
+        visual_refresh.setToolTip("刷新预览")
         visual_refresh.clicked.connect(self.refresh_visual_preview)
         visual_bar.addWidget(visual_refresh)
-        visual_layout.addLayout(visual_bar)
+
+        self.preview_zoom = QComboBox()
+        self.preview_zoom.addItems(["75%", "90%", "100%", "110%", "125%"])
+        self.preview_zoom.setCurrentText("100%")
+        self.preview_zoom.setFixedWidth(78)
+        self.preview_zoom.currentTextChanged.connect(self.apply_preview_zoom)
+        visual_bar.addWidget(self.preview_zoom)
+
+        fullscreen_btn = QPushButton("⛶")
+        fullscreen_btn.setToolTip("全屏预览")
+        fullscreen_btn.clicked.connect(self.toggle_preview_fullscreen)
+        visual_bar.addWidget(fullscreen_btn)
+
+        visual_right_layout.addLayout(visual_bar)
+
         self.web_preview = QWebEngineView()
-        self.web_preview.setHtml(
-            "<html><body style='font-family:Segoe UI;padding:32px;color:#666'>"
-            "<h3>可视化预览</h3><p>AI 返回 HTML 后，这里会显示实时界面效果。</p>"
-            "<p>也可以在“代码”页修改 HTML，再点击“刷新可视化”。</p>"
-            "</body></html>"
-        )
-        visual_layout.addWidget(self.web_preview)
+        self.web_preview.setMinimumWidth(600)
+        visual_right_layout.addWidget(self.web_preview, 1)
+
+        visual_split.addWidget(visual_left)
+        visual_split.addWidget(visual_right)
+        visual_split.setStretchFactor(0, 0)
+        visual_split.setStretchFactor(1, 1)
+        visual_split.setSizes([360, 980])
+
+        visual_layout.addWidget(visual_split, 1)
 
         self.tabs.addTab(self.chat, "对话")
         self.tabs.addTab(code_page, "代码")
@@ -1489,6 +1587,78 @@ class MainWindow(QMainWindow):
         self.refresh_chat()
         self.refresh_visual_preview()
 
+    def visual_quick_prompt(self, text):
+        self.visual_prompt.setPlainText(text)
+        self.visual_prompt.setFocus()
+
+    def send_visual_prompt(self):
+        text = self.visual_prompt.toPlainText().strip()
+        if not text:
+            return
+        self.prompt.setPlainText(text)
+        self.visual_prompt.clear()
+        self.tabs.setCurrentIndex(2)
+        self.send_prompt()
+
+    def apply_preview_zoom(self, value):
+        try:
+            zoom = int(value.replace("%", "")) / 100.0
+            self.web_preview.setZoomFactor(zoom)
+        except Exception:
+            self.web_preview.setZoomFactor(1.0)
+
+    def toggle_preview_fullscreen(self):
+        self.web_preview.setWindowFlag(Qt.Window, True)
+        if self.web_preview.isFullScreen():
+            self.web_preview.showNormal()
+        else:
+            self.web_preview.showFullScreen()
+
+    def build_device_preview(self, app_html):
+        device = self.preview_device.currentText() if hasattr(self, "preview_device") else "iPhone 16 Pro"
+        srcdoc = html.escape(app_html or "", quote=True)
+
+        if device == "网页":
+            frame_css = "width:96%;height:88vh;border-radius:14px;border:1px solid #334155;"
+            shell_class = "web-shell"
+            notch = ""
+        elif device == "平板":
+            frame_css = "width:820px;height:1080px;border-radius:28px;border:12px solid #111827;"
+            shell_class = "device-shell"
+            notch = "<div class='camera-dot'></div>"
+        elif device == "Android":
+            frame_css = "width:390px;height:844px;border-radius:34px;border:10px solid #111827;"
+            shell_class = "device-shell"
+            notch = "<div class='android-camera'></div>"
+        else:
+            frame_css = "width:393px;height:852px;border-radius:46px;border:12px solid #111827;"
+            shell_class = "device-shell"
+            notch = "<div class='dynamic-island'></div>"
+
+        return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html,body{{margin:0;height:100%;background:#05080f;font-family:Segoe UI,sans-serif;overflow:auto}}
+.stage{{min-height:100%;display:flex;align-items:center;justify-content:center;padding:28px}}
+.device-shell,.web-shell{{position:relative;background:#0b1220;box-shadow:0 24px 70px rgba(0,0,0,.55);overflow:hidden}}
+.dynamic-island{{position:absolute;z-index:3;top:10px;left:50%;transform:translateX(-50%);width:116px;height:28px;border-radius:18px;background:#050505}}
+.android-camera{{position:absolute;z-index:3;top:10px;left:50%;transform:translateX(-50%);width:14px;height:14px;border-radius:50%;background:#050505}}
+.camera-dot{{position:absolute;z-index:3;top:8px;left:50%;transform:translateX(-50%);width:8px;height:8px;border-radius:50%;background:#050505}}
+iframe{{width:100%;height:100%;border:0;background:white}}
+</style>
+</head>
+<body>
+<div class="stage">
+<div class="{shell_class}" style="{frame_css}">
+{notch}
+<iframe sandbox="allow-scripts allow-forms allow-modals allow-same-origin" srcdoc="{srcdoc}"></iframe>
+</div>
+</div>
+</body>
+</html>"""
+
     def extract_html(self, text):
         if not text:
             return ""
@@ -1506,19 +1676,33 @@ class MainWindow(QMainWindow):
 
     def refresh_visual_preview(self):
         code = self.raw.toPlainText().strip()
-        html = self.extract_html(code)
-        if not html:
-            self.visual_status.setText("未检测到可预览的 HTML")
-            self.web_preview.setHtml(
-                "<html><body style='font-family:Segoe UI;padding:32px;color:#666'>"
-                "<h3>暂无可视化内容</h3>"
-                "<p>“可视化”目前直接渲染 HTML/CSS/JavaScript。</p>"
-                "<p>让 AI 生成网页/UI 代码，或在“代码”页粘贴完整 HTML 后点击刷新。</p>"
-                "</body></html>"
-            )
-            return
-        self.web_preview.setHtml(html)
-        self.visual_status.setText("HTML 可视化预览已更新")
+        page_html = self.extract_html(code)
+
+        if not page_html:
+            page_html = """
+            <!doctype html>
+            <html>
+            <head><meta charset="utf-8"></head>
+            <body style="margin:0;background:#07111f;color:#e5edf7;font-family:Segoe UI,sans-serif;">
+              <div style="padding:24px">
+                <div style="font-size:13px;color:#91a4ba;margin-bottom:18px">实时应用预览</div>
+                <div style="padding:20px;border:1px solid #203249;border-radius:18px;background:#0c1a2b">
+                  <h2 style="margin-top:0">等待可视化内容</h2>
+                  <p style="line-height:1.7;color:#aebfd1">让 Gemini 生成或修改 HTML / CSS / JavaScript 后，界面会在这里按设备模式实时显示。</p>
+                </div>
+              </div>
+            </body>
+            </html>
+            """
+            self.visual_status.setText("等待可视化内容")
+        else:
+            self.visual_status.setText("实时预览")
+
+        self.web_preview.setHtml(self.build_device_preview(page_html))
+        self.apply_preview_zoom(self.preview_zoom.currentText())
+
+        if hasattr(self, "visual_chat"):
+            self.visual_chat.setHtml(self.chat_document())
 
     def on_error(self, text):
         self.send_btn.setEnabled(True)
@@ -1691,8 +1875,14 @@ function copyB64(b64, btn) {{
 </html>"""
 
     def refresh_chat(self, streaming=""):
-        self.chat.setHtml(self.chat_document(streaming))
+        doc = self.chat_document(streaming)
+        self.chat.setHtml(doc)
         self.chat.page().runJavaScript("window.scrollTo(0, document.body.scrollHeight);")
+        if hasattr(self, "visual_chat"):
+            self.visual_chat.setHtml(doc)
+            self.visual_chat.page().runJavaScript("window.scrollTo(0, document.body.scrollHeight);")
+        if hasattr(self, "visual_model_label"):
+            self.visual_model_label.setText(self.model.currentText())
         self.update_context()
 
     def new_chat(self):
