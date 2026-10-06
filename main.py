@@ -229,8 +229,8 @@ class GeminiWorker(QThread):
             messages.append({"role": "user", "content": content})
 
             api_model = self.model
-            if self.model.strip().lower() == "gemini-3-flash-preview":
-                api_model = "gemini-3-flash-preview"
+            if self.model.strip().lower() == "gemini-3.8-flash":
+                api_model = "gemini-3.8-flash"
 
             payload = {
                 "model": api_model,
@@ -348,7 +348,7 @@ class MainWindow(QMainWindow):
             "gemini-2.5-flash",
             "gemini-2.5-pro",
             "gemini-2.0-flash",
-            "gemini-3-flash-preview",
+            "gemini-3.8-flash",
         ])
         self.model.currentTextChanged.connect(self.on_model_changed)
         form.addRow("模型", self.model)
@@ -547,7 +547,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def on_model_changed(self, text):
-        if text.strip().lower() == "gemini-3-flash-preview":
+        if text.strip().lower() == "gemini-3.8-flash":
             self.api_base.setText("https://api.cxhao.com")
         elif self.api_base.text().strip().rstrip("/") == "https://api.cxhao.com":
             self.api_base.clear()
@@ -556,7 +556,7 @@ class MainWindow(QMainWindow):
         self.model.setCurrentText(self.settings.value("model", DEFAULT_MODEL))
         self.system_prompt.setPlainText(self.settings.value("system_prompt", ""))
         self.api_base.setText(self.settings.value("api_base", ""))
-        if self.model.currentText().strip().lower() == "gemini-3-flash-preview" and not self.api_base.text().strip():
+        if self.model.currentText().strip().lower() == "gemini-3.8-flash" and not self.api_base.text().strip():
             self.api_base.setText("https://api.cxhao.com")
         self.temperature.setValue(int(self.settings.value("temperature", 70)))
         self.top_p.setValue(int(self.settings.value("top_p", 95)))
