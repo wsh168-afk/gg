@@ -1441,7 +1441,7 @@ class MainWindow(QMainWindow):
         if self.history and self.history[-1].role == "user":
             pass
 
-        def on_chunk(self, text):
+    def on_chunk(self, text):
         self.current_response += text
         self.raw.moveCursor(QTextCursor.End)
         self.raw.insertPlainText(text)
