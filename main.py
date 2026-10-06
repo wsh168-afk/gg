@@ -16,10 +16,10 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QFont, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton,
-    QSlider, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QTextEdit,
-    QToolBar, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+    QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget, QTextBrowser,
+    QTextEdit, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from google import genai
@@ -92,6 +92,214 @@ class DropFileList(QListWidget):
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
+
+
+class GitHubRepoDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.settings = parent.settings
+        self.repo_owner = ""
+        self.repo_name = ""
+        self.setWindowTitle("GitHub 仓库")
+        self.resize(760, 620)
+        self.build_ui()
+        self.load_saved()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+
+        title = QLabel("绑定 GitHub 仓库")
+        title.setStyleSheet("font-size:18px;font-weight:700;")
+        layout.addWidget(title)
+
+        help_text = QLabel(
+            "公开仓库可不填 Token；私有仓库请填写 GitHub Personal Access Token。"
+            "Token 仅保存到本机设置中，不会写入项目或上传到仓库。"
+        )
+        help_text.setWordWrap(True)
+        help_text.setObjectName("helperText")
+        layout.addWidget(help_text)
+
+        form = QFormLayout()
+        self.repo_url = QLineEdit()
+        self.repo_url.setPlaceholderText("https://github.com/owner/repository")
+        form.addRow("仓库地址", self.repo_url)
+
+        self.branch = QLineEdit()
+        self.branch.setPlaceholderText("main")
+        form.addRow("分支", self.branch)
+
+        token_row = QHBoxLayout()
+        self.token = QLineEdit()
+        self.token.setEchoMode(QLineEdit.Password)
+        self.token.setPlaceholderText("GitHub PAT（私有仓库需要）")
+        token_row.addWidget(self.token, 1)
+        self.show_token = QPushButton("显示")
+        self.show_token.setCheckable(True)
+        self.show_token.setFixedWidth(58)
+        self.show_token.toggled.connect(self.toggle_token)
+        token_row.addWidget(self.show_token)
+        form.addRow("GitHub Token", token_row)
+
+        self.remember_token = QCheckBox("在本机记住 Token")
+        form.addRow("", self.remember_token)
+
+        layout.addLayout(form)
+
+        actions = QHBoxLayout()
+        self.test_btn = QPushButton("测试连接")
+        self.test_btn.clicked.connect(self.test_connection)
+        self.load_btn = QPushButton("加载文件树")
+        self.load_btn.clicked.connect(self.load_tree)
+        self.add_btn = QPushButton("加入 AI 上下文")
+        self.add_btn.clicked.connect(self.add_selected_to_context)
+        actions.addWidget(self.test_btn)
+        actions.addWidget(self.load_btn)
+        actions.addStretch()
+        actions.addWidget(self.add_btn)
+        layout.addLayout(actions)
+
+        self.status = QLabel("未连接")
+        self.status.setObjectName("helperText")
+        layout.addWidget(self.status)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["仓库文件", "类型"])
+        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        layout.addWidget(self.tree, 1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+    def toggle_token(self, checked):
+        self.token.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        self.show_token.setText("隐藏" if checked else "显示")
+
+    def load_saved(self):
+        self.repo_url.setText(self.settings.value("github_repo_url", ""))
+        self.branch.setText(self.settings.value("github_branch", "main"))
+        remember = self.settings.value("github_remember_token", False, type=bool)
+        self.remember_token.setChecked(remember)
+        if remember:
+            self.token.setText(self.settings.value("github_token", ""))
+
+    def save_binding(self):
+        self.settings.setValue("github_repo_url", self.repo_url.text().strip())
+        self.settings.setValue("github_branch", self.branch.text().strip() or "main")
+        self.settings.setValue("github_remember_token", self.remember_token.isChecked())
+        if self.remember_token.isChecked():
+            self.settings.setValue("github_token", self.token.text().strip())
+        else:
+            self.settings.remove("github_token")
+
+    def parse_repo(self):
+        url = self.repo_url.text().strip().rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
+        m = re.search(r"github\.com[/:]([^/]+)/([^/]+)$", url, re.I)
+        if not m:
+            raise ValueError("仓库地址格式不正确。示例：https://github.com/owner/repo")
+        self.repo_owner, self.repo_name = m.group(1), m.group(2)
+        return self.repo_owner, self.repo_name
+
+    def github_request(self, path):
+        owner, name = self.parse_repo()
+        url = f"https://api.github.com/repos/{owner}/{name}{path}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "GeminiDevStudio",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = self.token.text().strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if e.code == 401:
+                raise RuntimeError("GitHub Token 无效或已过期。")
+            if e.code == 403:
+                raise RuntimeError("GitHub 拒绝访问。请检查 Token 权限或 API 限额。")
+            if e.code == 404:
+                raise RuntimeError("找不到仓库或当前 Token 无权访问该私有仓库。")
+            raise RuntimeError(f"GitHub API HTTP {e.code}: {body[:500]}")
+
+    def test_connection(self):
+        try:
+            data = self.github_request("")
+            self.save_binding()
+            default_branch = data.get("default_branch") or "main"
+            if not self.branch.text().strip():
+                self.branch.setText(default_branch)
+            self.status.setText(
+                f"连接成功：{data.get('full_name', '')} · 默认分支 {default_branch}"
+            )
+            QMessageBox.information(self, "连接成功", "GitHub 仓库连接正常。")
+        except Exception as e:
+            self.status.setText("连接失败")
+            QMessageBox.warning(self, "GitHub 连接失败", str(e))
+
+    def load_tree(self):
+        try:
+            owner, name = self.parse_repo()
+            branch = self.branch.text().strip() or "main"
+            data = self.github_request(f"/git/trees/{urllib.parse.quote(branch, safe='')}?recursive=1")
+            self.tree.clear()
+            count = 0
+            for entry in data.get("tree", []):
+                path = entry.get("path", "")
+                typ = entry.get("type", "")
+                if not path:
+                    continue
+                item = QTreeWidgetItem([path, "文件" if typ == "blob" else "目录"])
+                item.setData(0, Qt.UserRole, entry)
+                if typ != "blob":
+                    item.setDisabled(True)
+                self.tree.addTopLevelItem(item)
+                count += 1
+                if count >= 5000:
+                    break
+            self.save_binding()
+            self.status.setText(f"已加载 {count} 个条目")
+        except Exception as e:
+            QMessageBox.warning(self, "加载失败", str(e))
+
+    def add_selected_to_context(self):
+        items = [i for i in self.tree.selectedItems() if not i.isDisabled()]
+        if not items:
+            QMessageBox.information(self, "未选择文件", "请先在文件树中选择一个或多个文件。")
+            return
+        try:
+            branch = self.branch.text().strip() or "main"
+            temp_root = Path(tempfile.gettempdir()) / "GeminiDevStudio" / "github"
+            temp_root.mkdir(parents=True, exist_ok=True)
+            added = []
+            for item in items[:100]:
+                entry = item.data(0, Qt.UserRole) or {}
+                path = entry.get("path")
+                if not path:
+                    continue
+                quoted = urllib.parse.quote(path, safe="/")
+                data = self.github_request(f"/contents/{quoted}?ref={urllib.parse.quote(branch, safe='')}")
+                if data.get("encoding") == "base64" and data.get("content"):
+                    raw = base64.b64decode(data["content"])
+                    target = temp_root / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(raw)
+                    added.append(str(target))
+            self.parent_window.attach_paths(added)
+            self.status.setText(f"已加入 AI 上下文：{len(added)} 个文件")
+            QMessageBox.information(self, "已加入上下文", f"已加入 {len(added)} 个仓库文件。")
+        except Exception as e:
+            QMessageBox.warning(self, "读取失败", str(e))
 
 
 class GeminiWorker(QThread):
@@ -301,6 +509,7 @@ class MainWindow(QMainWindow):
             ("新建会话", self.new_chat),
             ("保存会话", self.save_session),
             ("打开会话", self.load_session),
+            ("GitHub 仓库", self.open_github_repo),
             ("导出回答", self.export_answer),
         ]:
             action = QAction(name, self)
@@ -420,6 +629,9 @@ class MainWindow(QMainWindow):
         h1.setFont(QFont("Microsoft YaHei UI", 16, QFont.Bold))
         head.addWidget(h1)
         head.addStretch()
+        self.repo_label = QLabel("GitHub：未绑定")
+        self.repo_label.setObjectName("helperText")
+        head.addWidget(self.repo_label)
         self.context_label = QLabel("0 条消息 · 0 个附件")
         head.addWidget(self.context_label)
         rl.addLayout(head)
@@ -546,6 +758,15 @@ class MainWindow(QMainWindow):
         self._test_worker = worker
         worker.start()
 
+    def open_github_repo(self):
+        dialog = GitHubRepoDialog(self)
+        dialog.exec()
+        repo_url = self.settings.value("github_repo_url", "")
+        if repo_url:
+            self.repo_label.setText(f"GitHub：{repo_url.rstrip('/').split('/')[-1]}")
+        else:
+            self.repo_label.setText("GitHub：未绑定")
+
     def on_model_changed(self, text):
         if text.strip().lower() == "gemini-3.8-flash":
             self.api_base.setText("https://api.cxhao.com")
@@ -568,6 +789,12 @@ class MainWindow(QMainWindow):
             self.api_key.setText(self.settings.value("api_key", ""))
         elif os.getenv("GEMINI_API_KEY"):
             self.api_key.setText(os.getenv("GEMINI_API_KEY", ""))
+
+        repo_url = self.settings.value("github_repo_url", "")
+        if repo_url:
+            self.repo_label.setText(f"GitHub：{repo_url.rstrip('/').split('/')[-1]}")
+        else:
+            self.repo_label.setText("GitHub：未绑定")
 
     def save_settings(self):
         self.settings.setValue("model", self.model.currentText().strip())
