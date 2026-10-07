@@ -32,9 +32,14 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from google import genai
 from google.genai import types
 
-APP_NAME = "Gemini Dev Studio"
-ORG_NAME = "IndependentDevTools"
+APP_NAME = "TUT AI Studio"
+ORG_NAME = "TUTAIStudio"
 DEFAULT_MODEL = "gemini-2.5-flash"
+
+def resource_path(relative_path):
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative_path
+
 
 @dataclass
 class ChatMessage:
@@ -64,7 +69,7 @@ class SendTextEdit(QTextEdit):
         if source.hasImage():
             image = source.imageData()
             if image is not None:
-                target = Path(tempfile.gettempdir()) / f"gemini-paste-{uuid.uuid4().hex}.png"
+                target = Path(tempfile.gettempdir()) / f"tut-ai-studio-paste-{uuid.uuid4().hex}.png"
                 if image.save(str(target), "PNG"):
                     self.files_attached.emit([str(target)])
                     return
@@ -818,11 +823,14 @@ class MainWindow(QMainWindow):
         self._auto_fix_timer.setSingleShot(True)
         self._auto_fix_timer.timeout.connect(self.trigger_runtime_auto_fix)
 
-        default_workspace = Path.home() / "Documents" / "GeminiDevStudioData" / "workspaces"
+        default_workspace = Path.home() / "Documents" / "TUTAIStudioData" / "workspaces"
         self.workspace_root = Path(self.settings.value("workspace_root", str(default_workspace)))
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
         self.setWindowTitle(f"{APP_NAME} · Windows")
+        icon_path = resource_path("assets/tut-ai-studio.png")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1360, 850)
         self.setMinimumSize(980, 640)
         self.build_ui()
@@ -850,8 +858,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(theme_label)
 
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["浅色", "深色", "护眼", "灰蓝"])
-        self.theme_combo.setFixedWidth(88)
+        self.theme_combo.addItems(["TUT霓虹", "深色", "灰蓝", "护眼", "浅色"])
+        self.theme_combo.setFixedWidth(100)
         self.theme_combo.currentTextChanged.connect(self.apply_theme)
         bar.addWidget(self.theme_combo)
 
@@ -965,8 +973,18 @@ class MainWindow(QMainWindow):
         rl = QVBoxLayout(right)
 
         head = QHBoxLayout()
+        logo = QLabel()
+        logo_path = resource_path("assets/tut-ai-studio.png")
+        if logo_path.exists():
+            logo_pix = QPixmap(str(logo_path))
+            if not logo_pix.isNull():
+                logo.setPixmap(logo_pix.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        logo.setFixedSize(38, 38)
+        head.addWidget(logo)
+
         h1 = QLabel(APP_NAME)
         h1.setFont(QFont("Microsoft YaHei UI", 16, QFont.Bold))
+        h1.setObjectName("brandTitle")
         head.addWidget(h1)
         head.addStretch()
         self.repo_label = QLabel("GitHub：未绑定")
@@ -1185,6 +1203,23 @@ class MainWindow(QMainWindow):
         self.settings.setValue("theme", theme_name)
 
         themes = {
+            "TUT霓虹": {
+                "window": "#07111f",
+                "panel": "#0b1830",
+                "card": "#0e203b",
+                "input": "#0b1a31",
+                "text": "#edf7ff",
+                "muted": "#8ea9c7",
+                "border": "#1f4f7d",
+                "tab": "#102644",
+                "tab_selected": "#12385f",
+                "hover": "#12345a",
+                "pressed": "#0e2948",
+                "accent": "#16d9ff",
+                "accent_hover": "#3de5ff",
+                "assistant": "#0d1f38",
+                "user": "#12355d",
+            },
             "浅色": {
                 "window": "#edf1f7",
                 "panel": "#f7f9fc",
@@ -1255,7 +1290,7 @@ class MainWindow(QMainWindow):
             },
         }
 
-        t = themes.get(theme_name, themes["护眼"])
+        t = themes.get(theme_name, themes["TUT霓虹"])
         QApplication.instance().setStyleSheet(f"""
             QMainWindow, QWidget {{
                 font-family: "Microsoft YaHei UI", "Segoe UI";
@@ -1374,6 +1409,40 @@ class MainWindow(QMainWindow):
             "QPushButton:disabled { background:#7a7f87; color:#d7d7d7; }"
         )
 
+        if theme_name == "TUT霓虹":
+            QApplication.instance().setStyleSheet(
+                QApplication.instance().styleSheet() + """
+                QLabel#brandTitle {
+                    color: #7eeeff;
+                    font-size: 18px;
+                    font-weight: 800;
+                }
+                QToolBar {
+                    border-bottom: 1px solid #145a8d;
+                }
+                QTabBar::tab:selected {
+                    color: #9cf4ff;
+                    border: 1px solid #1abfe6;
+                    border-bottom: none;
+                }
+                QPushButton {
+                    border: 1px solid #245a86;
+                }
+                QPushButton:hover {
+                    border: 1px solid #20d9ff;
+                }
+                """
+            )
+            self.send_btn.setStyleSheet(
+                "QPushButton {"
+                "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                "stop:0 #0866ff, stop:0.48 #13d9ff, stop:0.74 #3ee67a, stop:1 #ffb323);"
+                "color:#04111f;border:1px solid #7ef4ff;font-weight:800;"
+                "padding:8px 22px;border-radius:8px;}"
+                "QPushButton:hover {border:1px solid #ffffff;}"
+                "QPushButton:disabled {background:#31445a;color:#8aa0b8;border-color:#40566f;}"
+            )
+
         self._theme_colors = t
         self.refresh_chat()
 
@@ -1435,12 +1504,12 @@ class MainWindow(QMainWindow):
         else:
             self.repo_label.setText("GitHub：未绑定")
 
-        theme = self.settings.value("theme", "护眼")
+        theme = self.settings.value("theme", "TUT霓虹")
         idx = self.theme_combo.findText(theme)
         if idx >= 0:
             self.theme_combo.setCurrentIndex(idx)
         else:
-            self.theme_combo.setCurrentText("护眼")
+            self.theme_combo.setCurrentText("TUT霓虹")
         self.apply_theme(self.theme_combo.currentText())
 
     def on_model_changed(self, text):
@@ -1553,7 +1622,7 @@ class MainWindow(QMainWindow):
         if mime.hasImage():
             image = QApplication.clipboard().image()
             if not image.isNull():
-                target = Path(tempfile.gettempdir()) / f"gemini-paste-{uuid.uuid4().hex}.png"
+                target = Path(tempfile.gettempdir()) / f"tut-ai-studio-paste-{uuid.uuid4().hex}.png"
                 if image.save(str(target), "PNG"):
                     self.attach_paths([str(target)])
                     self.statusBar().showMessage("已粘贴图片到附件", 3000)
@@ -2384,6 +2453,9 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
     app.setStyle("Fusion")
+    icon_path = resource_path("assets/tut-ai-studio.png")
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
     return app.exec()
