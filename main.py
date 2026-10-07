@@ -19,7 +19,7 @@ import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QSettings, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QProcess, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QFont, QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
@@ -810,6 +810,13 @@ class MainWindow(QMainWindow):
         self.preview_server = None
         self.preview_server_thread = None
         self.preview_url = ""
+        self.auto_fix_attempts = 0
+        self.max_auto_fix_attempts = 2
+        self._build_log_buffer = ""
+        self._runtime_error_buffer = []
+        self._auto_fix_timer = QTimer(self)
+        self._auto_fix_timer.setSingleShot(True)
+        self._auto_fix_timer.timeout.connect(self.trigger_runtime_auto_fix)
 
         default_workspace = Path.home() / "Documents" / "GeminiDevStudioData" / "workspaces"
         self.workspace_root = Path(self.settings.value("workspace_root", str(default_workspace)))
@@ -1563,6 +1570,58 @@ class MainWindow(QMainWindow):
     def update_context(self):
         self.context_label.setText(f"{len(self.history)} 条消息 · {len(self.files)} 个附件")
 
+    def collect_project_context_files(self):
+        if not self.project_root or not Path(self.project_root).exists():
+            return []
+
+        root = Path(self.project_root)
+        skip_dirs = {
+            ".git", ".idea", ".vscode", "node_modules", "dist", "build",
+            "out", "www", ".next", ".gradle", "__pycache__", "coverage",
+            "Pods", "DerivedData"
+        }
+        allowed_exts = {
+            ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+            ".json", ".html", ".css", ".scss", ".sass", ".less",
+            ".vue", ".svelte", ".md", ".txt", ".xml", ".yaml", ".yml",
+            ".java", ".kt", ".kts", ".gradle", ".properties",
+            ".py", ".go", ".rs", ".php", ".rb", ".swift",
+            ".c", ".cpp", ".h", ".hpp", ".cs", ".dart",
+            ".sql", ".sh", ".ps1", ".bat", ".cmd", ".toml", ".ini", ".env"
+        }
+        priority_names = {
+            "package.json", "vite.config.ts", "vite.config.js",
+            "tsconfig.json", "index.html", "README.md",
+            "capacitor.config.ts", "capacitor.config.json"
+        }
+
+        files = []
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            if any(part in skip_dirs for part in rel.parts):
+                continue
+            if path.name in priority_names or path.suffix.lower() in allowed_exts:
+                try:
+                    if path.stat().st_size <= 800 * 1024:
+                        files.append(path)
+                except OSError:
+                    continue
+
+        def score(p):
+            rel = p.relative_to(root).as_posix()
+            if p.name in priority_names:
+                return (0, len(rel), rel)
+            if rel.startswith("src/"):
+                return (1, len(rel), rel)
+            if rel.startswith("app/"):
+                return (2, len(rel), rel)
+            return (3, len(rel), rel)
+
+        files.sort(key=score)
+        return [str(p) for p in files[:180]]
+
     def send_prompt(self):
         key = self.api_key.text().strip()
         prompt = self.prompt.toPlainText().strip()
@@ -1603,10 +1662,19 @@ class MainWindow(QMainWindow):
 不要只输出 diff，不要省略未修改部分，不要用“其余不变”。
 只有真正需要修改或新增的文件才输出 file: 文件块。
 如果是 Web/React/Vite/Capacitor 项目，确保修改后项目能通过现有 build 脚本构建。
+你会收到当前项目的最新源码上下文。必须基于现有文件修改，不要凭空重建无关架构。
+所有需要变更的文件都必须以 file: 文件块输出，桌面程序会自动写入并立即构建、运行和刷新可视化。
 """
         system_instruction = self.system_prompt.toPlainText().strip()
         if self.project_root:
             system_instruction = (system_instruction + "\n\n" + auto_instruction).strip()
+
+        context_files = []
+        seen = set()
+        for p in list(self.files) + self.collect_project_context_files():
+            if p not in seen and Path(p).exists():
+                seen.add(p)
+                context_files.append(p)
 
         self.worker = GeminiWorker(
             key,
@@ -1614,7 +1682,7 @@ class MainWindow(QMainWindow):
             self.api_base.text().strip(),
             previous,
             prompt,
-            list(self.files),
+            context_files,
             system_instruction,
             self.temperature.value() / 100,
             self.top_p.value() / 100,
@@ -1747,8 +1815,11 @@ class MainWindow(QMainWindow):
 
         if applied:
             self.raw.setPlainText(
-                "已自动写入项目文件：\n\n" + "\n".join(f"✓ {p}" for p in applied)
+                "已自动写入当前项目，并将立即重新构建：\n\n"
+                + "\n".join(f"✓ {p}" for p in applied)
             )
+            if hasattr(self, "project_status"):
+                self.project_status.setText(f"项目：{Path(self.project_root).name} · 已修改 {len(applied)} 个文件")
         return applied
 
     def detect_preview_directory(self):
@@ -1774,7 +1845,8 @@ class MainWindow(QMainWindow):
         if not package_file.exists():
             preview_dir = self.detect_preview_directory()
             if preview_dir:
-                self.start_preview_server(preview_dir)
+                self.auto_fix_attempts = 0
+        self.start_preview_server(preview_dir)
             else:
                 self.visual_status.setText("项目没有可预览入口")
             return
@@ -1817,6 +1889,7 @@ class MainWindow(QMainWindow):
 
         self.visual_status.setText("正在构建…")
         self.visual_build_btn.setEnabled(False)
+        self._build_log_buffer = ""
 
         if not (root / "node_modules").exists():
             self._build_stage = "install"
@@ -1830,6 +1903,7 @@ class MainWindow(QMainWindow):
             return
         text = bytes(self.build_process.readAllStandardOutput()).decode("utf-8", errors="replace")
         if text:
+            self._build_log_buffer = (self._build_log_buffer + text)[-60000:]
             current = self.raw.toPlainText()
             self.raw.setPlainText((current + "\n" + text)[-120000:])
             cursor = self.raw.textCursor()
@@ -1851,8 +1925,14 @@ class MainWindow(QMainWindow):
 
         if exit_code != 0:
             self.visual_status.setText("构建失败")
-            self.statusBar().showMessage("项目构建失败，请查看“代码”页构建日志", 8000)
+            self.statusBar().showMessage("项目构建失败，正在尝试让 AI 自动修复…", 8000)
             self.tabs.setCurrentIndex(1)
+            if self.auto_fix_attempts < self.max_auto_fix_attempts:
+                self.auto_fix_attempts += 1
+                self.request_auto_fix(
+                    "构建失败",
+                    self._build_log_buffer or self.raw.toPlainText()[-12000:]
+                )
             return
 
         preview_dir = self.detect_preview_directory()
@@ -1966,14 +2046,46 @@ class MainWindow(QMainWindow):
             cursor.movePosition(QTextCursor.End)
             self.raw.setTextCursor(cursor)
         lower = message.lower()
-        if any(k in lower for k in ("uncaught", "typeerror", "referenceerror", "syntaxerror", "failed to load")):
+        if any(k in lower for k in ("uncaught", "typeerror", "referenceerror", "syntaxerror", "failed to load", "chunkloaderror")):
             self.visual_status.setText("运行错误")
-            self.statusBar().showMessage("预览检测到 JavaScript 运行错误，请查看“代码”页日志", 8000)
+            self.statusBar().showMessage("预览检测到运行错误，准备自动修复…", 8000)
+            self._runtime_error_buffer.append(message)
+            self._runtime_error_buffer = self._runtime_error_buffer[-20:]
+            if self.auto_fix_attempts < self.max_auto_fix_attempts and not self._auto_fix_timer.isActive():
+                self._auto_fix_timer.start(1400)
+
+    def trigger_runtime_auto_fix(self):
+        if not self._runtime_error_buffer:
+            return
+        if self.auto_fix_attempts >= self.max_auto_fix_attempts:
+            return
+        errors = "\n".join(self._runtime_error_buffer[-12:])
+        self._runtime_error_buffer.clear()
+        self.auto_fix_attempts += 1
+        self.request_auto_fix("运行时错误", errors)
+
+    def request_auto_fix(self, reason, error_text):
+        if not self.project_root:
+            return
+        if self.worker and self.worker.isRunning():
+            return
+
+        fix_prompt = (
+            f"当前项目自动修改后出现{reason}。请根据当前项目最新源码和下面错误日志直接修复。"
+            "必须输出所有需要修改文件的完整 file: 文件块，不要只解释。\n\n"
+            f"错误日志：\n{error_text[-14000:]}"
+        )
+        self.prompt.setPlainText(fix_prompt)
+        self.tabs.setCurrentIndex(2)
+        self.statusBar().showMessage(f"AI 自动修复中（{self.auto_fix_attempts}/{self.max_auto_fix_attempts}）…", 8000)
+        self.send_prompt()
 
     def on_preview_load_finished(self, ok):
         if ok:
             if self.preview_url:
                 self.visual_status.setText("运行中")
+                self._runtime_error_buffer.clear()
+                QTimer.singleShot(2500, self.mark_preview_stable)
         else:
             self.visual_status.setText("预览加载失败")
             self.statusBar().showMessage("应用页面加载失败，请查看“代码”页日志", 8000)
@@ -2028,6 +2140,10 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "visual_chat"):
             self.visual_chat.setHtml(self.chat_document())
+
+    def mark_preview_stable(self):
+        if self.visual_status.text() == "运行中":
+            self.auto_fix_attempts = 0
 
     def on_error(self, text):
         self.send_btn.setEnabled(True)
