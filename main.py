@@ -1846,7 +1846,7 @@ class MainWindow(QMainWindow):
             preview_dir = self.detect_preview_directory()
             if preview_dir:
                 self.auto_fix_attempts = 0
-        self.start_preview_server(preview_dir)
+                self.start_preview_server(preview_dir)
             else:
                 self.visual_status.setText("项目没有可预览入口")
             return
