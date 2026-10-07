@@ -1807,10 +1807,21 @@ class MainWindow(QMainWindow):
         if (not stopped) and final_text and self.project_root:
             changed = self.apply_ai_file_blocks(final_text)
             if changed:
-                self.statusBar().showMessage(f"已自动修改 {len(changed)} 个项目文件，正在构建…", 5000)
-                self.start_project_build(changed)
+                missing = self.validate_project_completeness()
+                if missing:
+                    self.queue_project_completion(missing)
+                else:
+                    self.statusBar().showMessage(
+                        f"已自动修改 {len(changed)} 个项目文件，完整性检查通过，正在构建…",
+                        6000
+                    )
+                    self.start_project_build(changed)
             else:
-                self.refresh_visual_preview()
+                missing = self.validate_project_completeness()
+                if missing:
+                    self.queue_project_completion(missing)
+                else:
+                    self.refresh_visual_preview()
         else:
             self.refresh_visual_preview()
 
@@ -1990,7 +2001,7 @@ class MainWindow(QMainWindow):
             if candidate.exists():
                 return True, candidate
 
-        return False, candidates[0] if candidates else base
+        return False, base
 
     def validate_project_completeness(self):
         if not self.project_root:
@@ -2085,6 +2096,73 @@ class MainWindow(QMainWindow):
 
         return cleaned[:80]
 
+    def queue_project_completion(self, missing):
+        if not missing:
+            return
+
+        self._pending_completion_missing = list(missing)
+        self.visual_status.setText("项目文件不完整")
+
+        if hasattr(self, "project_status"):
+            self.project_status.setText(
+                f"项目：{Path(self.project_root).name} · 缺少 {len(missing)} 项"
+            )
+
+        preview = "\n".join(f"• {item}" for item in missing[:12])
+        self.raw.setPlainText(
+            "项目完整性检查未通过，正在让 AI 自动补齐：\n\n" + preview
+        )
+        self.statusBar().showMessage(
+            f"检测到 {len(missing)} 个缺失或无效项目项，准备自动补齐…",
+            8000,
+        )
+
+        self._completion_retry_waits = 0
+        QTimer.singleShot(350, self.trigger_project_completion)
+
+    def trigger_project_completion(self):
+        if not self._pending_completion_missing:
+            return
+
+        if self.worker and self.worker.isRunning():
+            self._completion_retry_waits += 1
+            if self._completion_retry_waits < 24:
+                QTimer.singleShot(250, self.trigger_project_completion)
+            return
+
+        if self.auto_fix_attempts >= self.max_auto_fix_attempts:
+            self.visual_status.setText("项目仍不完整")
+            self.statusBar().showMessage(
+                "自动补齐次数已用完，请查看代码页中的缺失文件列表。",
+                10000,
+            )
+            return
+
+        missing = list(self._pending_completion_missing)
+        self._pending_completion_missing = []
+        self.auto_fix_attempts += 1
+
+        missing_text = "\n".join(f"- {item}" for item in missing)
+        completion_prompt = (
+            "当前项目在写入你上一轮代码后仍不完整，暂时无法构建或运行。"
+            "请基于当前项目最新源码直接补齐全部必需文件和配置，不要只解释。"
+            "每个需要新增或修复的文件都必须输出完整的 file:相对路径 文件块；"
+            "不要输出 diff，不要写“其余不变”。"
+            "如果缺 package.json，请给出可以实际执行 npm install 和 npm run build 的完整 package.json。"
+            "如果 index.html 引用了 src/main.tsx 或 src/main.ts，请确保入口文件存在，"
+            "并继续补齐入口文件所引用的 App、组件、数据、样式等所有缺失文件。"
+            "输出后桌面程序会自动写入、再次检查、构建并刷新可视化。\n\n"
+            f"完整性检查发现以下问题：\n{missing_text}"
+        )
+
+        self.prompt.setPlainText(completion_prompt)
+        self.tabs.setCurrentIndex(2)
+        self.statusBar().showMessage(
+            f"AI 正在补齐项目（{self.auto_fix_attempts}/{self.max_auto_fix_attempts}）…",
+            8000,
+        )
+        self.send_prompt()
+
     def detect_preview_directory(self):
         if not self.project_root:
             return None
@@ -2108,6 +2186,12 @@ class MainWindow(QMainWindow):
             self.settings.setValue("last_project_root", str(self.project_root))
 
         root = Path(self.project_root)
+
+        missing = self.validate_project_completeness()
+        if missing:
+            self.queue_project_completion(missing)
+            return
+
         package_file = root / "package.json"
 
         if hasattr(self, "project_status"):
@@ -2427,6 +2511,7 @@ class MainWindow(QMainWindow):
     def mark_preview_stable(self):
         if self.visual_status.text() == "运行中":
             self.auto_fix_attempts = 0
+            self._pending_completion_missing = []
 
     def on_error(self, text):
         self.send_btn.setEnabled(True)
