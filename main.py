@@ -828,7 +828,7 @@ class MainWindow(QMainWindow):
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
         self.setWindowTitle(f"{APP_NAME} · Windows")
-        icon_path = resource_path("assets/tut-ai-studio.png")
+        icon_path = resource_path("assets/tut-ai-studio.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1360, 850)
@@ -974,7 +974,7 @@ class MainWindow(QMainWindow):
 
         head = QHBoxLayout()
         logo = QLabel()
-        logo_path = resource_path("assets/tut-ai-studio.png")
+        logo_path = resource_path("assets/tut-ai-studio.ico")
         if logo_path.exists():
             logo_pix = QPixmap(str(logo_path))
             if not logo_pix.isNull():
@@ -2453,7 +2453,7 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
     app.setStyle("Fusion")
-    icon_path = resource_path("assets/tut-ai-studio.png")
+    icon_path = resource_path("assets/tut-ai-studio.ico")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
