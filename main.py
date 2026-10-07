@@ -2003,8 +2003,8 @@ class MainWindow(QMainWindow):
             if preview_dir:
                 self.auto_fix_attempts = 0
                 if hasattr(self, "project_status"):
-            self.project_status.setText(f"项目：{Path(self.project_root).name} · 构建成功")
-        self.start_preview_server(preview_dir)
+                    self.project_status.setText(f"项目：{root.name} · 可直接预览")
+                self.start_preview_server(preview_dir)
             else:
                 self.visual_status.setText("项目没有可预览入口")
                 if hasattr(self, "project_status"):
@@ -2105,6 +2105,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("未找到 dist/build/www/out/index.html", 8000)
             return
 
+        self.auto_fix_attempts = 0
+        if hasattr(self, "project_status"):
+            self.project_status.setText(f"项目：{Path(self.project_root).name} · 构建成功")
         self.start_preview_server(preview_dir)
 
     def start_preview_server(self, directory):
