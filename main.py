@@ -819,6 +819,8 @@ class MainWindow(QMainWindow):
         self.max_auto_fix_attempts = 2
         self._build_log_buffer = ""
         self._runtime_error_buffer = []
+        self._pending_completion_missing = []
+        self._completion_retry_waits = 0
         self._auto_fix_timer = QTimer(self)
         self._auto_fix_timer.setSingleShot(True)
         self._auto_fix_timer.timeout.connect(self.trigger_runtime_auto_fix)
@@ -1968,6 +1970,120 @@ class MainWindow(QMainWindow):
             if hasattr(self, "project_status"):
                 self.project_status.setText(f"项目：{Path(self.project_root).name} · 已修改 {len(applied)} 个文件")
         return applied
+
+    def resolve_relative_import(self, source_file, import_path):
+        if not import_path.startswith("."):
+            return True, None
+
+        base = source_file.parent / import_path
+        candidates = []
+
+        if base.suffix:
+            candidates.append(base)
+        else:
+            for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css", ".scss", ".sass", ".less"):
+                candidates.append(Path(str(base) + ext))
+            for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+                candidates.append(base / f"index{ext}")
+
+        for candidate in candidates:
+            if candidate.exists():
+                return True, candidate
+
+        return False, candidates[0] if candidates else base
+
+    def validate_project_completeness(self):
+        if not self.project_root:
+            return []
+
+        root = Path(self.project_root)
+        missing = []
+        index_file = root / "index.html"
+        package_file = root / "package.json"
+
+        web_source_files = []
+        for folder_name in ("src", "app"):
+            folder = root / folder_name
+            if folder.exists():
+                for ext in ("*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs"):
+                    web_source_files.extend(folder.rglob(ext))
+
+        if index_file.exists():
+            try:
+                index_text = index_file.read_text(encoding="utf-8", errors="replace")
+                script_srcs = re.findall(
+                    r'<script[^>]+src=["\x27]([^"\x27]+)["\x27]',
+                    index_text,
+                    flags=re.I,
+                )
+                for src in script_srcs:
+                    if src.startswith(("http://", "https://", "//")):
+                        continue
+                    rel = src.split("?", 1)[0].split("#", 1)[0].lstrip("/")
+                    if rel and not (root / rel).exists():
+                        missing.append(rel)
+            except Exception:
+                pass
+
+        looks_like_node_web = bool(web_source_files)
+        if index_file.exists():
+            try:
+                txt = index_file.read_text(encoding="utf-8", errors="replace").lower()
+                if "src/main.tsx" in txt or "src/main.ts" in txt or 'type="module"' in txt:
+                    looks_like_node_web = True
+            except Exception:
+                pass
+
+        if looks_like_node_web and not package_file.exists():
+            missing.append("package.json")
+
+        if package_file.exists():
+            try:
+                package = json.loads(package_file.read_text(encoding="utf-8"))
+                scripts = package.get("scripts") or {}
+                deps = {}
+                deps.update(package.get("dependencies") or {})
+                deps.update(package.get("devDependencies") or {})
+                is_vite_like = any(k in deps for k in ("vite", "react", "@vitejs/plugin-react"))
+                if is_vite_like and "build" not in scripts:
+                    missing.append("package.json 缺少 scripts.build")
+            except Exception as e:
+                missing.append(f"package.json 无法解析：{e}")
+
+        import_re = re.compile(
+            r'(?:import\s+(?:[^;]*?\s+from\s+)?|export\s+[^;]*?\s+from\s+|require\s*\()\s*["\x27]([^"\x27]+)["\x27]',
+            re.M,
+        )
+
+        for source in web_source_files[:600]:
+            try:
+                source_text = source.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            for imp in import_re.findall(source_text):
+                if not imp.startswith("."):
+                    continue
+                ok, expected = self.resolve_relative_import(source, imp)
+                if ok:
+                    continue
+                try:
+                    rel_source = source.relative_to(root).as_posix()
+                    rel_expected = expected.relative_to(root).as_posix() if expected else imp
+                except Exception:
+                    rel_source = str(source)
+                    rel_expected = str(expected or imp)
+                missing.append(f"{rel_expected}（由 {rel_source} 引用）")
+
+        cleaned = []
+        seen = set()
+        for item in missing:
+            item = str(item).strip()
+            if item and item not in seen:
+                seen.add(item)
+                cleaned.append(item)
+
+        return cleaned[:80]
 
     def detect_preview_directory(self):
         if not self.project_root:
