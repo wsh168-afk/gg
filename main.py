@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget, QTextBrowser,
     QTextEdit, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from google import genai
 from google.genai import types
@@ -787,6 +788,15 @@ class GeminiWorker(QThread):
                     pass
 
 
+class PreviewWebPage(QWebEnginePage):
+    console_message = Signal(str)
+
+    def javaScriptConsoleMessage(self, level, message, line_number, source_id):
+        source = source_id or "app"
+        self.console_message.emit(f"[JS] {source}:{line_number}  {message}")
+        super().javaScriptConsoleMessage(level, message, line_number, source_id)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1060,7 +1070,7 @@ class MainWindow(QMainWindow):
         self.preview_device = QComboBox()
         self.preview_device.addItems(["iPhone 16 Pro", "Android", "平板", "网页"])
         self.preview_device.setFixedWidth(125)
-        self.preview_device.currentTextChanged.connect(self.refresh_visual_preview)
+        self.preview_device.currentTextChanged.connect(self.on_preview_device_changed)
         visual_bar.addWidget(self.preview_device)
 
         self.preview_path = QLineEdit("/")
@@ -1087,9 +1097,33 @@ class MainWindow(QMainWindow):
 
         visual_right_layout.addLayout(visual_bar)
 
+        self.preview_stage = QWidget()
+        self.preview_stage.setObjectName("previewStage")
+        self.preview_stage.setStyleSheet("#previewStage { background:#05080f; }")
+        stage_layout = QHBoxLayout(self.preview_stage)
+        stage_layout.setContentsMargins(18, 18, 18, 18)
+        stage_layout.addStretch()
+
+        self.device_frame = QWidget()
+        self.device_frame.setObjectName("deviceFrame")
+        self.device_frame.setStyleSheet(
+            "#deviceFrame { background:#111827; border:10px solid #111827; border-radius:34px; }"
+        )
+        frame_layout = QVBoxLayout(self.device_frame)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+
         self.web_preview = QWebEngineView()
-        self.web_preview.setMinimumWidth(600)
-        visual_right_layout.addWidget(self.web_preview, 1)
+        self.preview_page = PreviewWebPage(self.web_preview)
+        self.preview_page.console_message.connect(self.on_preview_console_message)
+        self.web_preview.setPage(self.preview_page)
+        self.web_preview.loadFinished.connect(self.on_preview_load_finished)
+        frame_layout.addWidget(self.web_preview)
+
+        stage_layout.addWidget(self.device_frame, 0, Qt.AlignCenter)
+        stage_layout.addStretch()
+
+        visual_right_layout.addWidget(self.preview_stage, 1)
+        self.apply_device_frame()
 
         visual_split.addWidget(visual_left)
         visual_split.addWidget(visual_right)
@@ -1891,55 +1925,58 @@ class MainWindow(QMainWindow):
         else:
             self.web_preview.showFullScreen()
 
-    def build_device_preview(self, app_html="", app_url=""):
+    def on_preview_device_changed(self, _text):
+        self.apply_device_frame()
+        self.refresh_visual_preview()
+
+    def apply_device_frame(self):
+        if not hasattr(self, "device_frame"):
+            return
         device = self.preview_device.currentText() if hasattr(self, "preview_device") else "iPhone 16 Pro"
 
         if device == "网页":
-            frame_css = "width:96%;height:88vh;border-radius:14px;border:1px solid #334155;"
-            shell_class = "web-shell"
-            notch = ""
+            self.device_frame.setMinimumSize(700, 500)
+            self.device_frame.setMaximumSize(16777215, 16777215)
+            self.device_frame.setStyleSheet(
+                "#deviceFrame { background:#111827; border:2px solid #334155; border-radius:14px; }"
+            )
         elif device == "平板":
-            frame_css = "width:820px;height:1080px;border-radius:28px;border:12px solid #111827;"
-            shell_class = "device-shell"
-            notch = "<div class='camera-dot'></div>"
+            self.device_frame.setFixedSize(820, 1080)
+            self.device_frame.setStyleSheet(
+                "#deviceFrame { background:#111827; border:12px solid #111827; border-radius:28px; }"
+            )
         elif device == "Android":
-            frame_css = "width:390px;height:844px;border-radius:34px;border:10px solid #111827;"
-            shell_class = "device-shell"
-            notch = "<div class='android-camera'></div>"
+            self.device_frame.setFixedSize(410, 864)
+            self.device_frame.setStyleSheet(
+                "#deviceFrame { background:#111827; border:10px solid #111827; border-radius:34px; }"
+            )
         else:
-            frame_css = "width:393px;height:852px;border-radius:46px;border:12px solid #111827;"
-            shell_class = "device-shell"
-            notch = "<div class='dynamic-island'></div>"
+            self.device_frame.setFixedSize(417, 876)
+            self.device_frame.setStyleSheet(
+                "#deviceFrame { background:#111827; border:12px solid #111827; border-radius:46px; }"
+            )
 
-        if app_url:
-            iframe = f'<iframe src="{html.escape(app_url, quote=True)}"></iframe>'
+    def on_preview_console_message(self, message):
+        if not message:
+            return
+        current = self.raw.toPlainText()
+        if message not in current[-12000:]:
+            self.raw.setPlainText((current + "\n" + message)[-120000:])
+            cursor = self.raw.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.raw.setTextCursor(cursor)
+        lower = message.lower()
+        if any(k in lower for k in ("uncaught", "typeerror", "referenceerror", "syntaxerror", "failed to load")):
+            self.visual_status.setText("运行错误")
+            self.statusBar().showMessage("预览检测到 JavaScript 运行错误，请查看“代码”页日志", 8000)
+
+    def on_preview_load_finished(self, ok):
+        if ok:
+            if self.preview_url:
+                self.visual_status.setText("运行中")
         else:
-            srcdoc = html.escape(app_html or "", quote=True)
-            iframe = f'<iframe sandbox="allow-scripts allow-forms allow-modals allow-same-origin" srcdoc="{srcdoc}"></iframe>'
-
-        return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-html,body{{margin:0;height:100%;background:#05080f;font-family:Segoe UI,sans-serif;overflow:auto}}
-.stage{{min-height:100%;display:flex;align-items:center;justify-content:center;padding:28px}}
-.device-shell,.web-shell{{position:relative;background:#0b1220;box-shadow:0 24px 70px rgba(0,0,0,.55);overflow:hidden}}
-.dynamic-island{{position:absolute;z-index:3;top:10px;left:50%;transform:translateX(-50%);width:116px;height:28px;border-radius:18px;background:#050505}}
-.android-camera{{position:absolute;z-index:3;top:10px;left:50%;transform:translateX(-50%);width:14px;height:14px;border-radius:50%;background:#050505}}
-.camera-dot{{position:absolute;z-index:3;top:8px;left:50%;transform:translateX(-50%);width:8px;height:8px;border-radius:50%;background:#050505}}
-iframe{{width:100%;height:100%;border:0;background:white}}
-</style>
-</head>
-<body>
-<div class="stage">
-<div class="{shell_class}" style="{frame_css}">
-{notch}
-{iframe}
-</div>
-</div>
-</body>
-</html>"""
+            self.visual_status.setText("预览加载失败")
+            self.statusBar().showMessage("应用页面加载失败，请查看“代码”页日志", 8000)
 
     def extract_html(self, text):
         if not text:
@@ -1957,13 +1994,15 @@ iframe{{width:100%;height:100%;border:0;background:white}}
         return ""
 
     def refresh_visual_preview(self):
+        self.apply_device_frame()
+
         if self.preview_url:
             path = self.preview_path.text().strip() if hasattr(self, "preview_path") else "/"
             if not path.startswith("/"):
                 path = "/" + path
             app_url = self.preview_url.rstrip("/") + path
-            self.web_preview.setHtml(self.build_device_preview(app_url=app_url))
-            self.visual_status.setText("运行中")
+            self.web_preview.load(QUrl(app_url))
+            self.visual_status.setText("正在加载…")
         else:
             code = self.raw.toPlainText().strip()
             page_html = self.extract_html(code)
@@ -1976,14 +2015,14 @@ iframe{{width:100%;height:100%;border:0;background:white}}
                     <h2>等待项目构建</h2>
                     <p style="line-height:1.7;color:#aebfd1">
                     上传项目 ZIP 后，Gemini 返回的 file: 文件块会自动写入项目，
-                    软件随后自动构建，并在这里运行真实应用。
+                    软件随后自动构建，并在这里直接运行真实应用。
                     </p>
                   </div>
                 </body>
                 </html>
                 """
                 self.visual_status.setText("等待项目构建")
-            self.web_preview.setHtml(self.build_device_preview(app_html=page_html))
+            self.web_preview.setHtml(page_html)
 
         self.apply_preview_zoom(self.preview_zoom.currentText())
 
