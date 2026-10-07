@@ -39,7 +39,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name TUT-AI-Studio --icon assets/tut-ai-studio.png --add-data "assets/tut-ai-studio.png;assets" --hidden-import PySide6.QtCore --hidden-import PySide6.QtGui --hidden-import PySide6.QtWidgets --hidden-import PySide6.QtWebEngineWidgets --collect-all PySide6.QtWebEngineCore --collect-all PySide6.QtWebEngineWidgets main.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name TUT-AI-Studio --icon assets/tut-ai-studio.ico --add-data "assets/tut-ai-studio.ico;assets" --hidden-import PySide6.QtCore --hidden-import PySide6.QtGui --hidden-import PySide6.QtWidgets --hidden-import PySide6.QtWebEngineWidgets --collect-all PySide6.QtWebEngineCore --collect-all PySide6.QtWebEngineWidgets main.py
 
       - name: Verify EXE exists
         shell: pwsh
