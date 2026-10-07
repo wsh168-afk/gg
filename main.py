@@ -522,6 +522,64 @@ class GeminiWorker(QThread):
     def cancel(self):
         self._cancel_requested = True
 
+    @staticmethod
+    def source_text_extensions():
+        return {
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs",
+            ".java", ".kt", ".kts", ".cs", ".cpp", ".c", ".h", ".hpp",
+            ".html", ".htm", ".css", ".scss", ".sass", ".less",
+            ".json", ".xml", ".yaml", ".yml", ".md", ".txt", ".sql",
+            ".sh", ".ps1", ".bat", ".cmd", ".toml", ".ini", ".cfg",
+            ".conf", ".properties", ".gradle", ".dart", ".go", ".rs",
+            ".php", ".rb", ".swift", ".vue", ".svelte", ".env",
+            ".gitignore", ".dockerignore", ".editorconfig", ".npmrc",
+            ".svg", ".graphql", ".gql", ".lock"
+        }
+
+    @staticmethod
+    def supported_binary_mimes():
+        return {
+            "image/jpeg", "image/jpg", "image/png", "image/webp",
+            "image/heic", "image/heif",
+            "video/mp4", "video/mpeg", "video/mpegps", "video/avi",
+            "video/x-msvideo", "video/quicktime", "video/mov",
+            "video/mpg", "video/x-ms-wmv", "video/wmv", "video/x-flv",
+            "video/flv",
+            "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
+            "application/pdf",
+        }
+
+    def classify_input_file(self, path):
+        file_path = Path(path)
+        suffix = file_path.suffix.lower()
+
+        if suffix in self.source_text_extensions():
+            return "text", "text/plain"
+
+        mime, _ = mimetypes.guess_type(str(file_path))
+        mime = (mime or "").lower()
+
+        aliases = {
+            "image/jpg": "image/jpeg",
+            "video/x-msvideo": "video/avi",
+            "video/quicktime": "video/mov",
+            "audio/x-wav": "audio/wav",
+        }
+        normalized = aliases.get(mime, mime)
+
+        if normalized == "application/pdf":
+            return "pdf", normalized
+        if normalized in self.supported_binary_mimes():
+            if normalized.startswith("image/"):
+                return "image", normalized
+            if normalized.startswith("video/"):
+                return "video", normalized
+            if normalized.startswith("audio/"):
+                return "audio", normalized
+            return "binary", normalized
+
+        return "skip", mime or "application/octet-stream"
+
     def expand_input_files(self):
         expanded = []
         temp_dirs = []
@@ -529,19 +587,15 @@ class GeminiWorker(QThread):
             ".git", ".idea", ".vscode", "node_modules", "build", "dist",
             ".gradle", "__pycache__", ".next", "target", "vendor"
         }
-        text_exts = {
-            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".kts", ".cs",
-            ".cpp", ".c", ".h", ".hpp", ".html", ".htm", ".css", ".scss", ".sass",
-            ".json", ".xml", ".yaml", ".yml", ".md", ".txt", ".sql", ".sh", ".ps1",
-            ".bat", ".cmd", ".toml", ".ini", ".cfg", ".conf", ".properties",
-            ".gradle", ".dart", ".go", ".rs", ".php", ".rb", ".swift", ".vue",
-            ".svelte", ".env", ".gitignore", ".dockerignore"
-        }
+        text_exts = self.source_text_extensions()
 
         for original in self.files:
             p = Path(original)
             if p.suffix.lower() != ".zip":
-                expanded.append(str(p))
+                if p.exists() and p.is_file():
+                    kind, _mime = self.classify_input_file(p)
+                    if kind != "skip":
+                        expanded.append(str(p))
                 continue
 
             try:
@@ -573,16 +627,8 @@ class GeminiWorker(QThread):
                 for file in out.rglob("*"):
                     if not file.is_file():
                         continue
-                    suffix = file.suffix.lower()
-                    mime, _ = mimetypes.guess_type(str(file))
-                    mime = mime or ""
-                    if (
-                        suffix in text_exts
-                        or mime.startswith("image/")
-                        or mime.startswith("video/")
-                        or mime.startswith("audio/")
-                        or mime == "application/pdf"
-                    ):
+                    kind, _mime = self.classify_input_file(file)
+                    if kind != "skip":
                         candidates.append(str(file))
 
                 candidates.sort(key=lambda x: (Path(x).suffix.lower() not in text_exts, len(x), x))
@@ -614,9 +660,23 @@ class GeminiWorker(QThread):
                 text=self.prompt or "请分析附件并给出结果。"
             )]
             for f in input_files:
-                obj = client.files.upload(file=f)
-                uploaded.append(obj)
-                parts.append(obj)
+                file_path = Path(f)
+                kind, mime = self.classify_input_file(file_path)
+
+                if kind == "text":
+                    try:
+                        source_text = file_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    parts.append(types.Part.from_text(
+                        text=f"\n\n--- 项目文件: {file_path.name} ---\n{source_text[:500000]}"
+                    ))
+                    continue
+
+                if kind in {"image", "video", "audio", "pdf"}:
+                    obj = client.files.upload(file=f)
+                    uploaded.append(obj)
+                    parts.append(obj)
 
             contents.append(types.Content(role="user", parts=parts))
             config = types.GenerateContentConfig(
@@ -671,54 +731,64 @@ class GeminiWorker(QThread):
             prompt_text = self.prompt or "请分析附件并给出结果。"
             content = [{"type": "text", "text": prompt_text}]
 
+            total_text_chars = 0
+            max_total_text_chars = 1600000
+
             for path in input_files:
                 file_path = Path(path)
-                mime, _ = mimetypes.guess_type(path)
-                mime = mime or "application/octet-stream"
+                kind, mime = self.classify_input_file(file_path)
+
+                if kind == "skip":
+                    continue
+
+                if kind == "text":
+                    if total_text_chars >= max_total_text_chars:
+                        continue
+                    try:
+                        source_text = file_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    remaining = max_total_text_chars - total_text_chars
+                    source_text = source_text[:min(500000, remaining)]
+                    total_text_chars += len(source_text)
+                    content.append({
+                        "type": "text",
+                        "text": f"\n\n--- 项目文件: {file_path.name} ---\n{source_text}"
+                    })
+                    continue
+
                 raw = file_path.read_bytes()
                 b64 = base64.b64encode(raw).decode("ascii")
                 data_url = f"data:{mime};base64,{b64}"
 
-                if mime.startswith("image/"):
+                if kind == "image":
                     content.append({
                         "type": "image_url",
                         "image_url": {"url": data_url}
                     })
-                elif mime.startswith("video/"):
+                elif kind == "video":
                     content.append({
                         "type": "video_url",
                         "video_url": {"url": data_url}
                     })
-                elif mime.startswith("audio/"):
+                elif kind == "audio":
+                    audio_format = file_path.suffix.lower().lstrip(".")
+                    if audio_format == "mpeg":
+                        audio_format = "mp3"
                     content.append({
                         "type": "input_audio",
                         "input_audio": {
                             "data": b64,
-                            "format": file_path.suffix.lower().lstrip(".") or "wav"
+                            "format": audio_format or "wav"
                         }
                     })
-                elif mime.startswith("text/") or file_path.suffix.lower() in {
-                    ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".cs",
-                    ".cpp", ".c", ".h", ".hpp", ".html", ".css", ".json", ".xml",
-                    ".yaml", ".yml", ".md", ".txt", ".sql", ".sh", ".ps1", ".bat"
-                }:
-                    text = raw.decode("utf-8", errors="replace")
-                    content.append({
-                        "type": "text",
-                        "text": f"\n\n--- 附件: {file_path.name} ---\n{text[:500000]}"
-                    })
-                elif mime == "application/pdf":
+                elif kind == "pdf":
                     content.append({
                         "type": "file",
                         "file": {
                             "filename": file_path.name,
                             "file_data": data_url
                         }
-                    })
-                else:
-                    content.append({
-                        "type": "text",
-                        "text": f"\n[已跳过接口不支持的附件类型：{file_path.name} ({mime})]"
                     })
 
             messages.append({"role": "user", "content": content})
@@ -777,9 +847,9 @@ class GeminiWorker(QThread):
             body = e.read().decode("utf-8", errors="replace")
             if "mime type is not supported" in body.lower():
                 self.failed.emit(
-                    "附件中包含当前模型接口不支持的文件类型。\n"
-                    "新版会自动解压 ZIP 并只发送模型支持的源码、图片、视频、音频和 PDF。\n\n"
-                    f"接口返回：HTTP {e.code}"
+                    "附件中仍有第三方接口拒绝的媒体类型。\n"
+                    "TUT AI Studio 已启用严格 MIME 白名单，并把源码（包括 SVG）按纯文本发送。\n\n"
+                    f"接口返回：HTTP {e.code}\n{body[:1200]}"
                 )
             else:
                 self.failed.emit(f"第三方 API 请求失败 HTTP {e.code}:\n{body[:1500]}")
