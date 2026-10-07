@@ -1812,6 +1812,84 @@ class MainWindow(QMainWindow):
         else:
             self.refresh_visual_preview()
 
+    def find_project_root(self, base):
+        base = Path(base)
+        if not base.exists():
+            return None
+
+        skip_dirs = {
+            ".git", "node_modules", "dist", "build", "out", "www",
+            ".next", ".gradle", "__pycache__", "coverage", "Pods", "DerivedData"
+        }
+
+        candidates = []
+
+        def score_dir(folder):
+            score = 100
+            package_file = folder / "package.json"
+            if package_file.exists():
+                score -= 60
+                try:
+                    pkg = json.loads(package_file.read_text(encoding="utf-8"))
+                    scripts = pkg.get("scripts") or {}
+                    deps = {}
+                    deps.update(pkg.get("dependencies") or {})
+                    deps.update(pkg.get("devDependencies") or {})
+                    if "build" in scripts:
+                        score -= 25
+                    if any(name in deps for name in ("vite", "react", "next", "@vitejs/plugin-react")):
+                        score -= 10
+                except Exception:
+                    pass
+            if (folder / "vite.config.ts").exists() or (folder / "vite.config.js").exists():
+                score -= 20
+            if (folder / "index.html").exists():
+                score -= 15
+            if (folder / "src").is_dir():
+                score -= 8
+            try:
+                depth = len(folder.relative_to(base).parts)
+            except Exception:
+                depth = 99
+            return (score, depth, len(str(folder)))
+
+        # base 本身优先参与判断
+        if (base / "package.json").exists() or (base / "index.html").exists():
+            candidates.append(base)
+
+        for package_file in base.rglob("package.json"):
+            try:
+                rel = package_file.relative_to(base)
+            except Exception:
+                continue
+            if any(part in skip_dirs for part in rel.parts):
+                continue
+            candidates.append(package_file.parent)
+
+        if not candidates:
+            for index_file in base.rglob("index.html"):
+                try:
+                    rel = index_file.relative_to(base)
+                except Exception:
+                    continue
+                if any(part in skip_dirs for part in rel.parts):
+                    continue
+                candidates.append(index_file.parent)
+
+        if not candidates:
+            return base
+
+        unique = []
+        seen = set()
+        for c in candidates:
+            key = str(c.resolve())
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+
+        unique.sort(key=score_dir)
+        return unique[0]
+
     def import_project_zip(self, zip_path):
         if not zipfile.is_zipfile(zip_path):
             raise RuntimeError("不是有效的 ZIP 项目压缩包。")
@@ -1836,18 +1914,18 @@ class MainWindow(QMainWindow):
                 with zf.open(info, "r") as src, open(out, "wb") as dst:
                     shutil.copyfileobj(src, dst)
 
-        children = [p for p in target.iterdir()]
-        if len(children) == 1 and children[0].is_dir():
-            candidate = children[0]
-            if (candidate / "package.json").exists() or (candidate / "index.html").exists():
-                target = candidate
+        detected = self.find_project_root(target)
+        self.project_root = detected or target
+        self.settings.setValue("last_project_root", str(self.project_root))
 
-        self.project_root = target
-        self.settings.setValue("last_project_root", str(target))
         if hasattr(self, "project_status"):
-            self.project_status.setText(f"项目：{target.name}")
-            self.project_status.setToolTip(str(target))
-        self.statusBar().showMessage(f"项目已导入工作区：{target}", 6000)
+            self.project_status.setText(f"项目：{self.project_root.name} · 已识别")
+            self.project_status.setToolTip(str(self.project_root))
+
+        self.statusBar().showMessage(
+            f"项目已导入，真实项目根目录：{self.project_root}",
+            8000
+        )
 
     def parse_ai_file_blocks(self, text):
         changes = []
@@ -1908,16 +1986,29 @@ class MainWindow(QMainWindow):
             self.refresh_visual_preview()
             return
 
-        root = self.project_root
+        detected = self.find_project_root(self.project_root)
+        if detected:
+            self.project_root = detected
+            self.settings.setValue("last_project_root", str(self.project_root))
+
+        root = Path(self.project_root)
         package_file = root / "package.json"
+
+        if hasattr(self, "project_status"):
+            self.project_status.setText(f"项目：{root.name} · 准备构建")
+            self.project_status.setToolTip(str(root))
 
         if not package_file.exists():
             preview_dir = self.detect_preview_directory()
             if preview_dir:
                 self.auto_fix_attempts = 0
-                self.start_preview_server(preview_dir)
+                if hasattr(self, "project_status"):
+            self.project_status.setText(f"项目：{Path(self.project_root).name} · 构建成功")
+        self.start_preview_server(preview_dir)
             else:
                 self.visual_status.setText("项目没有可预览入口")
+                if hasattr(self, "project_status"):
+                    self.project_status.setText(f"项目：{root.name} · 未找到 package.json/index.html")
             return
 
         try:
@@ -1957,6 +2048,8 @@ class MainWindow(QMainWindow):
         self.build_process.finished.connect(self.on_build_finished)
 
         self.visual_status.setText("正在构建…")
+        if hasattr(self, "project_status"):
+            self.project_status.setText(f"项目：{root.name} · 正在构建")
         self.visual_build_btn.setEnabled(False)
         self._build_log_buffer = ""
 
@@ -1994,6 +2087,8 @@ class MainWindow(QMainWindow):
 
         if exit_code != 0:
             self.visual_status.setText("构建失败")
+            if hasattr(self, "project_status"):
+                self.project_status.setText(f"项目：{Path(self.project_root).name} · 构建失败")
             self.statusBar().showMessage("项目构建失败，正在尝试让 AI 自动修复…", 8000)
             self.tabs.setCurrentIndex(1)
             if self.auto_fix_attempts < self.max_auto_fix_attempts:
