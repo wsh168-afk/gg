@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import html
+import http.server
 import difflib
 import json
 import mimetypes
@@ -9,6 +10,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import tempfile
 import urllib.error
 import uuid
@@ -17,7 +19,7 @@ import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QProcess, QSettings, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QFont, QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
@@ -793,6 +795,15 @@ class MainWindow(QMainWindow):
         self.files = []
         self.worker = None
         self.current_response = ""
+        self.project_root = None
+        self.build_process = None
+        self.preview_server = None
+        self.preview_server_thread = None
+        self.preview_url = ""
+
+        default_workspace = Path.home() / "Documents" / "GeminiDevStudioData" / "workspaces"
+        self.workspace_root = Path(self.settings.value("workspace_root", str(default_workspace)))
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
 
         self.setWindowTitle(f"{APP_NAME} · Windows")
         self.resize(1360, 850)
@@ -1034,6 +1045,10 @@ class MainWindow(QMainWindow):
         self.visual_status = QLabel("预览")
         self.visual_status.setStyleSheet("font-weight:700;")
         visual_bar.addWidget(self.visual_status)
+
+        self.project_status = QLabel("未载入项目")
+        self.project_status.setObjectName("helperText")
+        visual_bar.addWidget(self.project_status)
 
         code_switch_btn = QPushButton("</>")
         code_switch_btn.setToolTip("切换到代码")
@@ -1417,6 +1432,7 @@ class MainWindow(QMainWindow):
             self.repo_label.setText("GitHub：未绑定")
 
     def save_settings(self):
+        self.settings.setValue("workspace_root", str(self.workspace_root))
         self.settings.setValue("model", self.model.currentText().strip())
         self.settings.setValue("api_base", self.api_base.text().strip())
         self.settings.setValue("system_prompt", self.system_prompt.toPlainText())
@@ -1432,6 +1448,9 @@ class MainWindow(QMainWindow):
             self.settings.remove("api_key")
 
     def closeEvent(self, event):
+        self.stop_preview_server()
+        if self.build_process and self.build_process.state() != QProcess.NotRunning:
+            self.build_process.kill()
         self.save_settings()
         super().closeEvent(event)
 
@@ -1457,6 +1476,10 @@ class MainWindow(QMainWindow):
 
                 if Path(p).suffix.lower() == ".zip":
                     label += "   [项目压缩包 · 自动解压]"
+                    try:
+                        self.import_project_zip(Path(p))
+                    except Exception as e:
+                        QMessageBox.warning(self, "项目导入失败", str(e))
                 elif mime.startswith("image/"):
                     label += "   [图片]"
                 elif mime.startswith("video/"):
@@ -1529,6 +1552,28 @@ class MainWindow(QMainWindow):
         self.send_btn.setText("生成中…")
         self.stop_btn.setEnabled(True)
 
+        auto_instruction = """
+你正在一个可自动写回项目并实时构建的桌面开发环境中。
+如果用户要求修改、修复、增加功能或调整界面，请在解释之后输出每一个实际修改文件的【完整内容】，
+格式必须严格使用：
+
+```file:相对项目路径
+完整文件内容
+```
+
+例如：
+```file:src/App.tsx
+...完整文件...
+```
+
+不要只输出 diff，不要省略未修改部分，不要用“其余不变”。
+只有真正需要修改或新增的文件才输出 file: 文件块。
+如果是 Web/React/Vite/Capacitor 项目，确保修改后项目能通过现有 build 脚本构建。
+"""
+        system_instruction = self.system_prompt.toPlainText().strip()
+        if self.project_root:
+            system_instruction = (system_instruction + "\n\n" + auto_instruction).strip()
+
         self.worker = GeminiWorker(
             key,
             self.model.currentText().strip() or DEFAULT_MODEL,
@@ -1536,7 +1581,7 @@ class MainWindow(QMainWindow):
             previous,
             prompt,
             list(self.files),
-            self.system_prompt.toPlainText().strip(),
+            system_instruction,
             self.temperature.value() / 100,
             self.top_p.value() / 100,
             self.top_k.value(),
@@ -1585,7 +1630,239 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("生成完成", 4000)
 
         self.refresh_chat()
+
+        if (not stopped) and final_text and self.project_root:
+            changed = self.apply_ai_file_blocks(final_text)
+            if changed:
+                self.statusBar().showMessage(f"已自动修改 {len(changed)} 个项目文件，正在构建…", 5000)
+                self.start_project_build(changed)
+            else:
+                self.refresh_visual_preview()
+        else:
+            self.refresh_visual_preview()
+
+    def import_project_zip(self, zip_path):
+        if not zipfile.is_zipfile(zip_path):
+            raise RuntimeError("不是有效的 ZIP 项目压缩包。")
+
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", zip_path.stem).strip("-") or "project"
+        target = self.workspace_root / safe_name
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                member = Path(info.filename)
+                if member.is_absolute() or ".." in member.parts:
+                    continue
+                if info.file_size > 100 * 1024 * 1024:
+                    continue
+                out = target / member
+                out.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, "r") as src, open(out, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+        children = [p for p in target.iterdir()]
+        if len(children) == 1 and children[0].is_dir():
+            candidate = children[0]
+            if (candidate / "package.json").exists() or (candidate / "index.html").exists():
+                target = candidate
+
+        self.project_root = target
+        self.settings.setValue("last_project_root", str(target))
+        if hasattr(self, "project_status"):
+            self.project_status.setText(f"项目：{target.name}")
+            self.project_status.setToolTip(str(target))
+        self.statusBar().showMessage(f"项目已导入工作区：{target}", 6000)
+
+    def parse_ai_file_blocks(self, text):
+        changes = []
+        pattern = re.compile(
+            r"\`\`\`file:([^\r\n]+)\r?\n(.*?)\`\`\`",
+            re.S | re.I,
+        )
+        for match in pattern.finditer(text or ""):
+            rel = match.group(1).strip().replace("\\\\", "/")
+            body = match.group(2)
+            if not rel:
+                continue
+            rel_path = Path(rel)
+            if rel_path.is_absolute() or ".." in rel_path.parts:
+                continue
+            changes.append((rel_path, body))
+        return changes
+
+    def apply_ai_file_blocks(self, text):
+        if not self.project_root:
+            return []
+
+        root = self.project_root.resolve()
+        applied = []
+        for rel_path, body in self.parse_ai_file_blocks(text):
+            target = (root / rel_path).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            applied.append(str(rel_path))
+
+        if applied:
+            self.raw.setPlainText(
+                "已自动写入项目文件：\n\n" + "\n".join(f"✓ {p}" for p in applied)
+            )
+        return applied
+
+    def detect_preview_directory(self):
+        if not self.project_root:
+            return None
+        root = self.project_root
+        for name in ("dist", "build", "www", "out"):
+            candidate = root / name
+            if (candidate / "index.html").exists():
+                return candidate
+        if (root / "index.html").exists():
+            return root
+        return None
+
+    def start_project_build(self, changed_files=None):
+        if not self.project_root:
+            self.refresh_visual_preview()
+            return
+
+        root = self.project_root
+        package_file = root / "package.json"
+
+        if not package_file.exists():
+            preview_dir = self.detect_preview_directory()
+            if preview_dir:
+                self.start_preview_server(preview_dir)
+            else:
+                self.visual_status.setText("项目没有可预览入口")
+            return
+
+        try:
+            package = json.loads(package_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            self.visual_status.setText("package.json 无法读取")
+            self.statusBar().showMessage(str(e), 7000)
+            return
+
+        scripts = package.get("scripts") or {}
+        if "build" not in scripts:
+            preview_dir = self.detect_preview_directory()
+            if preview_dir:
+                self.start_preview_server(preview_dir)
+            else:
+                self.visual_status.setText("package.json 没有 build 脚本")
+            return
+
+        npm = shutil.which("npm.cmd") or shutil.which("npm")
+        if not npm:
+            self.visual_status.setText("需要安装 Node.js")
+            QMessageBox.warning(
+                self,
+                "无法自动构建",
+                "当前电脑没有检测到 npm。\n\n"
+                "React / Vite / Capacitor 项目需要安装 Node.js 后，软件才能自动执行 npm install 和 npm run build。"
+            )
+            return
+
+        if self.build_process and self.build_process.state() != QProcess.NotRunning:
+            self.build_process.kill()
+
+        self.build_process = QProcess(self)
+        self.build_process.setWorkingDirectory(str(root))
+        self.build_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.build_process.readyReadStandardOutput.connect(self.on_build_output)
+        self.build_process.finished.connect(self.on_build_finished)
+
+        self.visual_status.setText("正在构建…")
+        self.visual_build_btn.setEnabled(False)
+
+        if not (root / "node_modules").exists():
+            self._build_stage = "install"
+            self.build_process.start(npm, ["install", "--no-audit", "--no-fund"])
+        else:
+            self._build_stage = "build"
+            self.build_process.start(npm, ["run", "build"])
+
+    def on_build_output(self):
+        if not self.build_process:
+            return
+        text = bytes(self.build_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if text:
+            current = self.raw.toPlainText()
+            self.raw.setPlainText((current + "\n" + text)[-120000:])
+            cursor = self.raw.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.raw.setTextCursor(cursor)
+
+    def on_build_finished(self, exit_code, exit_status):
+        if not self.build_process:
+            return
+
+        npm = shutil.which("npm.cmd") or shutil.which("npm")
+        if getattr(self, "_build_stage", "") == "install" and exit_code == 0 and npm:
+            self._build_stage = "build"
+            self.visual_status.setText("依赖完成，正在构建…")
+            self.build_process.start(npm, ["run", "build"])
+            return
+
+        self.visual_build_btn.setEnabled(True)
+
+        if exit_code != 0:
+            self.visual_status.setText("构建失败")
+            self.statusBar().showMessage("项目构建失败，请查看“代码”页构建日志", 8000)
+            self.tabs.setCurrentIndex(1)
+            return
+
+        preview_dir = self.detect_preview_directory()
+        if not preview_dir:
+            self.visual_status.setText("构建成功，但未找到预览目录")
+            self.statusBar().showMessage("未找到 dist/build/www/out/index.html", 8000)
+            return
+
+        self.start_preview_server(preview_dir)
+
+    def start_preview_server(self, directory):
+        self.stop_preview_server()
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+        handler = lambda *args, **kwargs: QuietHandler(
+            *args, directory=str(directory), **kwargs
+        )
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.preview_server = server
+        port = server.server_address[1]
+        self.preview_url = f"http://127.0.0.1:{port}/"
+
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self.preview_server_thread = thread
+        thread.start()
+
+        self.visual_status.setText("运行中")
+        self.preview_path.setText("/")
+        self.statusBar().showMessage(f"构建成功，实时预览：{self.preview_url}", 7000)
         self.refresh_visual_preview()
+
+    def stop_preview_server(self):
+        if self.preview_server:
+            try:
+                self.preview_server.shutdown()
+                self.preview_server.server_close()
+            except Exception:
+                pass
+        self.preview_server = None
+        self.preview_server_thread = None
+        self.preview_url = ""
 
     def visual_quick_prompt(self, text):
         self.visual_prompt.setPlainText(text)
@@ -1614,9 +1891,8 @@ class MainWindow(QMainWindow):
         else:
             self.web_preview.showFullScreen()
 
-    def build_device_preview(self, app_html):
+    def build_device_preview(self, app_html="", app_url=""):
         device = self.preview_device.currentText() if hasattr(self, "preview_device") else "iPhone 16 Pro"
-        srcdoc = html.escape(app_html or "", quote=True)
 
         if device == "网页":
             frame_css = "width:96%;height:88vh;border-radius:14px;border:1px solid #334155;"
@@ -1634,6 +1910,12 @@ class MainWindow(QMainWindow):
             frame_css = "width:393px;height:852px;border-radius:46px;border:12px solid #111827;"
             shell_class = "device-shell"
             notch = "<div class='dynamic-island'></div>"
+
+        if app_url:
+            iframe = f'<iframe src="{html.escape(app_url, quote=True)}"></iframe>'
+        else:
+            srcdoc = html.escape(app_html or "", quote=True)
+            iframe = f'<iframe sandbox="allow-scripts allow-forms allow-modals allow-same-origin" srcdoc="{srcdoc}"></iframe>'
 
         return f"""<!doctype html>
 <html>
@@ -1653,7 +1935,7 @@ iframe{{width:100%;height:100%;border:0;background:white}}
 <div class="stage">
 <div class="{shell_class}" style="{frame_css}">
 {notch}
-<iframe sandbox="allow-scripts allow-forms allow-modals allow-same-origin" srcdoc="{srcdoc}"></iframe>
+{iframe}
 </div>
 </div>
 </body>
@@ -1675,30 +1957,34 @@ iframe{{width:100%;height:100%;border:0;background:white}}
         return ""
 
     def refresh_visual_preview(self):
-        code = self.raw.toPlainText().strip()
-        page_html = self.extract_html(code)
-
-        if not page_html:
-            page_html = """
-            <!doctype html>
-            <html>
-            <head><meta charset="utf-8"></head>
-            <body style="margin:0;background:#07111f;color:#e5edf7;font-family:Segoe UI,sans-serif;">
-              <div style="padding:24px">
-                <div style="font-size:13px;color:#91a4ba;margin-bottom:18px">实时应用预览</div>
-                <div style="padding:20px;border:1px solid #203249;border-radius:18px;background:#0c1a2b">
-                  <h2 style="margin-top:0">等待可视化内容</h2>
-                  <p style="line-height:1.7;color:#aebfd1">让 Gemini 生成或修改 HTML / CSS / JavaScript 后，界面会在这里按设备模式实时显示。</p>
-                </div>
-              </div>
-            </body>
-            </html>
-            """
-            self.visual_status.setText("等待可视化内容")
+        if self.preview_url:
+            path = self.preview_path.text().strip() if hasattr(self, "preview_path") else "/"
+            if not path.startswith("/"):
+                path = "/" + path
+            app_url = self.preview_url.rstrip("/") + path
+            self.web_preview.setHtml(self.build_device_preview(app_url=app_url))
+            self.visual_status.setText("运行中")
         else:
-            self.visual_status.setText("实时预览")
+            code = self.raw.toPlainText().strip()
+            page_html = self.extract_html(code)
+            if not page_html:
+                page_html = """
+                <!doctype html>
+                <html>
+                <body style="margin:0;background:#07111f;color:#e5edf7;font-family:Segoe UI,sans-serif;">
+                  <div style="padding:24px">
+                    <h2>等待项目构建</h2>
+                    <p style="line-height:1.7;color:#aebfd1">
+                    上传项目 ZIP 后，Gemini 返回的 file: 文件块会自动写入项目，
+                    软件随后自动构建，并在这里运行真实应用。
+                    </p>
+                  </div>
+                </body>
+                </html>
+                """
+                self.visual_status.setText("等待项目构建")
+            self.web_preview.setHtml(self.build_device_preview(app_html=page_html))
 
-        self.web_preview.setHtml(self.build_device_preview(page_html))
         self.apply_preview_zoom(self.preview_zoom.currentText())
 
         if hasattr(self, "visual_chat"):
